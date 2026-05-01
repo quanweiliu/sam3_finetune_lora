@@ -18,21 +18,22 @@
 
 本项目旨在使用 **LoRA (Low-Rank Adaptation)** 技术对 SAM3 (Segment Anything Model 3) 进行微调。LoRA 是一种参数高效的微调方法，可以将可训练参数量从 100% 降低到约 1%，同时保持甚至提升模型在特定任务上的性能。
 
-### 最近更新 (Recent Updates)
+### 更新 (Updates)
 
-**2026-02-03**:
-- **修复了训练/验证中的多类别分配 Bug**：之前在处理包含多个类别的图像时，会将所有对象错误分配给出现频率最高的类别。
-- 现在会根据每个类别创建独立的查询 (Query)，并将每个对象映射到其真实的类别。
-- 涉及文件：`scripts/training/train_sam3_lora_native.py`, `scripts/training/train_sam3_lora_with_categories.py`, `scripts/inference/validate_sam3_lora.py`。
+2026-05-01:
+- 新增 
+  - lqw/sam3_finetune_lora/scripts/data/vaihingen_dataset.py 支持一种新的遥感数据加载
+  - 模型支持只有 mask 的 concept prompt segmentation, 通过 mask 直接推理 bbox
 
-**2026-01-31**:
-- 在 `infer_sam.py` 中将 `--no-boxes` 替换为 `--boundingbox` 选项。
-- 新增 `--boundingbox True/False` 标志用于显式控制边界框显示（默认为 False）。
-
-**2026-01-04**:
-- **新增多 GPU 训练支持**：基于 DistributedDataParallel (DDP)。
-- 新增 `--device` 参数方便选择 GPU：例如 `--device 0 1 2 3`。
-- 当指定多个 GPU 时自动通过 `torchrun` 启动。
+- 拆分出数据和一些辅助函数：
+- 拆分
+  - lqw/sam3_finetune_lora/scripts/training/train_sam3_lora_native.py
+  - lqw/sam3_finetune_lora/scripts/inference/validate_sam3_lora.py
+  - lqw/sam3_finetune_lora/scripts/inference/infer_sam.py
+- 数据
+  - 拆分到 lqw/sam3_finetune_lora/scripts/data/COCODataset.py and lqw/sam3_finetune_lora/scripts/data/vaihingen_dataset.py
+- 辅助函数
+  - 拆分到 /home/icclab/Documents/lqw/sam3_finetune_lora/scripts/tools/utils.py
 
 
 ### 为什么选择本项目？
@@ -102,9 +103,10 @@ huggingface-cli login
 ## 快速入门 (Quick Start)
 
 ### 1. 准备数据
-将数据集整理为 **COCO 格式**，每个拆分（train/valid）包含一个标注文件：
+将数据集整理为 **COCO 格式** 每个拆分（train/valid）包含一个标注文件 or **Referring segmentation 格式**：
 
 ```
+**COCO 格式** 
 data/
 ├── train/                    # 必须
 │   ├── img001.jpg
@@ -112,22 +114,45 @@ data/
 ├── valid/                    # 强烈建议
 │   ├── img001.jpg
 │   └── _annotations.coco.json
+
+**Referring segmentation 格式**
+data/
+├── images/
+│   ├── train_1.jpg
+│   ├── val_1.jpg
+│   ├── test_1.jpg
+├── binary_masks/      
+│   ├── train_1.jpg   # 这里因为我是从语义分割数据集上构造的 referring masks，所谓我增加了一个层类别文件夹
+│   ├── val_1.jpg
+│   ├── test_1.jpg
 ```
 
 ### 2. 训练模型
 使用默认配置启动训练：
 ```bash
-python scripts/training/train_sam3_lora_native.py
-```
-或者指定自定义配置文件：
-```bash
-python scripts/training/train_sam3_lora_native.py --config configs/full_lora_config.yaml
-```
+# 单 GPU 自定义配置文件
+CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0
 
-**验证策略**：训练期间仅计算 **验证损失 (Loss)** 以确保速度；训练完成后，运行 `validate_sam3_lora.py` 获取完整的指标（mAP, cgF1）。
+# 多 GPU 自定义配置文件
+torchrun --nproc_per_node 2 scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0 1
+```
+Training script computes validation loss only.
 
 ### 3. 执行推理
 使用训练好的模型进行预测：
+
+计算指标
+```bash
+python scripts/inference/validate_sam3_lora.py \
+--config configs/vaihingen_lora_config.yaml \
+--weights outputs/sam3_lora_vaihingen/best_lora_weights.pt \ 
+--dataset-type vaihingen \ 
+--vai-data-dir /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef \ 
+--vai-split valid \
+--vai-variant concept\
+```
+
+可视化
 ```bash
 python scripts/inference/infer_sam.py \
   --config configs/full_lora_config.yaml \
@@ -136,16 +161,16 @@ python scripts/inference/infer_sam.py \
   --output predictions.png
 ```
 
+
+SAM3-LoRA uses a two-stage validation approach following SAM3's original design:
+- During Training: Only validation loss is computed (fast, no expensive metrics)
+- After Training: Run full evaluation with mAP, cgF1 metrics and NMS filtering
+
+This approach significantly speeds up training while still monitoring overfitting via validation loss.
+
+
 ---
 
-## 训练指南 (Training)
-
-### 多 GPU 训练
-使用 `--device` 参数指定多个 GPU，脚本会自动处理分布式设置：
-```bash
-# 使用 GPU 0 和 1 进行训练
-python scripts/training/train_sam3_lora_native.py --device 0 1
-```
 
 ### 自定义配置 (YAML)
 在配置文件中调整 LoRA 参数：
@@ -171,26 +196,6 @@ lora:
 
 ---
 
-## 实际案例：混凝土裂缝检测
-
-SAM3-LoRA 在结构缺陷检测方面表现出色。
-
-<div align="center">
-<img src="asset/output.png" alt="Concrete Crack Detection" width="600">
-</div>
-
-**示例命令：**
-```bash
-python scripts/inference/infer_sam.py \
-  --config configs/full_lora_config.yaml \
-  --image concrete.jpg \
-  --prompt "concrete crack" \
-  --threshold 0.3 \
-  --output crack_detection.png
-```
-
----
-
 ## 常见问题排查 (Troubleshooting)
 
 - **显存溢出 (OOM)**：减小 `batch_size` 或 `rank`。建议使用 `configs/light_lora_config.yaml`。
@@ -212,6 +217,13 @@ python scripts/inference/infer_sam.py \
 
 ---
 
+## Thanks
+
+- [SAM3_LoRA](https://github.com/Sompote/SAM3_LoRA)
+- [sam3_finetune_lora](https://github.com/doublefei0702/sam3_finetune_lora)
+
+---
+
 ## 开源协议 (License)
 
 本项目采用 Apache 2.0 协议。详见 [LICENSE](LICENSE) 文件。
@@ -220,7 +232,7 @@ python scripts/inference/infer_sam.py \
 
 <div align="center">
 
-**版本**: 1.0.0 | **构建者**: AI Research Group, KMUTT
+**版本**: 1.0.0 | **构建者**: ICCLab, Leo
 
 [⬆ 返回顶部](#sam3-lora-基于低秩自适应-lora-的高效微调)
 
