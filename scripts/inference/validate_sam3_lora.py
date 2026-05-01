@@ -5,6 +5,15 @@ Loads saved weights and runs validation with detailed debugging
 """
 
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, [1]))
+print('using GPU %s' % ','.join(map(str, [1])))
+
+import sys
+# Add project root and training directory for local imports
+_SCRIPT_DIR = os.path.dirname(__file__)
+sys.path.append(os.path.join(_SCRIPT_DIR, "../.."))
+sys.path.append(os.path.join(_SCRIPT_DIR, "../training"))
+
 import argparse
 import yaml
 import json
@@ -16,6 +25,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image as PILImage
 import contextlib
+import gc
 
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
@@ -40,276 +50,10 @@ from sam3.train.masks_ops import rle_encode
 # Import SAM3's NMS
 from sam3.perflib.nms import nms_masks
 
-class COCOSegmentDataset(Dataset):
-    """Dataset class for COCO format segmentation data"""
-    def __init__(self, data_dir, split="train"):
-        """
-        Args:
-            data_dir: Root directory containing train/valid/test folders
-            split: One of 'train', 'valid', 'test'
-        """
-        self.data_dir = Path(data_dir)
-        self.split = split
-        self.split_dir = self.data_dir / split
-
-        # Load COCO annotations
-        ann_file = self.split_dir / "_annotations.coco.json"
-        if not ann_file.exists():
-            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
-
-        with open(ann_file, 'r') as f:
-            self.coco_data = json.load(f)
-
-        # Build index: image_id -> image info
-        self.images = {img['id']: img for img in self.coco_data['images']}
-        self.image_ids = sorted(list(self.images.keys()))
-
-        # Build index: image_id -> list of annotations
-        self.img_to_anns = {}
-        for ann in self.coco_data['annotations']:
-            img_id = ann['image_id']
-            if img_id not in self.img_to_anns:
-                self.img_to_anns[img_id] = []
-            self.img_to_anns[img_id].append(ann)
-
-        # Load categories
-        self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
-        print(f"Loaded COCO dataset: {split} split")
-        print(f"  Images: {len(self.image_ids)}")
-        print(f"  Annotations: {len(self.coco_data['annotations'])}")
-        print(f"  Categories: {self.categories}")
-
-        self.resolution = 1008
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
-
-    def __len__(self):
-        return len(self.image_ids)
-
-    def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        img_info = self.images[img_id]
-
-        # Load image
-        img_path = self.split_dir / img_info['file_name']
-        pil_image = PILImage.open(img_path).convert("RGB")
-        orig_w, orig_h = pil_image.size
-
-        # Resize image
-        pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
-
-        # Transform to tensor
-        image_tensor = self.transform(pil_image)
-
-        # Get annotations for this image
-        annotations = self.img_to_anns.get(img_id, [])
-
-        objects = []
-        object_class_names = []
-
-        # Scale factors
-        scale_w = self.resolution / orig_w
-        scale_h = self.resolution / orig_h
-
-        for i, ann in enumerate(annotations):
-            # Get bbox - format is [x, y, width, height] in COCO format
-            bbox_coco = ann.get("bbox", None)
-            if bbox_coco is None:
-                continue
-
-            # Get class name from category_id
-            category_id = ann.get("category_id", 0)
-            class_name = self.categories.get(category_id, "object")
-            object_class_names.append(class_name)
-
-            # Convert from COCO [x, y, w, h] to [x1, y1, x2, y2]
-            x, y, w, h = bbox_coco
-            box_tensor = torch.tensor([x, y, x + w, y + h], dtype=torch.float32)
-
-            # Scale box to resolution
-            box_tensor[0] *= scale_w
-            box_tensor[2] *= scale_w
-            box_tensor[1] *= scale_h
-            box_tensor[3] *= scale_h
-
-            # IMPORTANT: Normalize boxes to [0, 1] range (required by SAM3 loss functions)
-            box_tensor /= self.resolution
-
-            # Handle segmentation mask (polygon or RLE format)
-            segment = None
-            segmentation = ann.get("segmentation", None)
-
-            if segmentation:
-                try:
-                    # Check if it's RLE format (dict) or polygon format (list)
-                    if isinstance(segmentation, dict):
-                        # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
-                    elif isinstance(segmentation, list):
-                        # Polygon format: [[x1, y1, x2, y2, ...], ...]
-                        # Convert polygon to RLE, then decode
-                        rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
-                        rle = mask_utils.merge(rles)
-                        mask_np = mask_utils.decode(rle)
-                    else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
-                        segment = None
-                        continue
-
-                    # Resize mask to model resolution
-                    mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
-                    mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(self.resolution, self.resolution),
-                        mode="nearest"
-                    )
-                    segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
-
-                except Exception as e:
-                    print(f"Warning: Error processing mask for image {img_id}, ann {i}: {e}")
-                    segment = None
-
-            obj = Object(
-                bbox=box_tensor,
-                area=(box_tensor[2]-box_tensor[0])*(box_tensor[3]-box_tensor[1]),
-                object_id=i,
-                segment=segment
-            )
-            objects.append(obj)
-
-        image_obj = Image(
-            data=image_tensor,
-            objects=objects,
-            size=(self.resolution, self.resolution)
-        )
-
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
-        from collections import defaultdict
-
-        # Group object IDs by their class name
-        class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[class_name.lower()].append(obj.object_id)
-
-        # Create one query per category
-        queries = []
-        if len(class_to_object_ids) > 0:
-            for query_text, obj_ids in class_to_object_ids.items():
-                query = FindQueryLoaded(
-                    query_text=query_text,
-                    image_id=0,
-                    object_ids_output=obj_ids,
-                    is_exhaustive=True,
-                    query_processing_order=0,
-                    inference_metadata=InferenceMetadata(
-                        coco_image_id=img_id,
-                        original_image_id=img_id,
-                        original_category_id=0,
-                        original_size=(orig_h, orig_w),
-                        object_id=-1,
-                        frame_index=-1
-                    )
-                )
-                queries.append(query)
-        else:
-            # No annotations: create a single generic query
-            query = FindQueryLoaded(
-                query_text="object",
-                image_id=0,
-                object_ids_output=[],
-                is_exhaustive=True,
-                query_processing_order=0,
-                inference_metadata=InferenceMetadata(
-                    coco_image_id=img_id,
-                    original_image_id=img_id,
-                    original_category_id=0,
-                    original_size=(orig_h, orig_w),
-                    object_id=-1,
-                    frame_index=-1
-                )
-            )
-            queries.append(query)
-
-        return Datapoint(
-            find_queries=queries,
-            images=[image_obj],
-            raw_images=[pil_image]
-        )
-
-
-def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
-    """
-    Merge overlapping masks that likely represent the same object (e.g., crack segments).
-
-    This is more aggressive than NMS - it MERGES masks instead of suppressing them.
-    Useful for cracks where model splits one crack into many segments.
-
-    Args:
-        binary_masks: Binary masks [N, H, W]
-        scores: Confidence scores [N]
-        boxes: Bounding boxes [N, 4]
-        iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
-
-    Returns:
-        Tuple of (merged_masks, merged_scores, merged_boxes)
-    """
-    if len(binary_masks) == 0:
-        return binary_masks, scores, boxes
-
-    # Sort by score (highest first)
-    sorted_indices = torch.argsort(scores, descending=True)
-    binary_masks = binary_masks[sorted_indices]
-    scores = scores[sorted_indices]
-    boxes = boxes[sorted_indices]
-
-    merged_masks = []
-    merged_scores = []
-    merged_boxes = []
-    used = torch.zeros(len(binary_masks), dtype=torch.bool)
-
-    for i in range(len(binary_masks)):
-        if used[i]:
-            continue
-
-        current_mask = binary_masks[i].clone()
-        current_score = scores[i].item()
-        current_box = boxes[i]
-        used[i] = True
-
-        # Find overlapping masks and merge them
-        for j in range(i + 1, len(binary_masks)):
-            if used[j]:
-                continue
-
-            # Compute IoU
-            intersection = (current_mask & binary_masks[j]).sum().item()
-            union = (current_mask | binary_masks[j]).sum().item()
-            iou = intersection / union if union > 0 else 0
-
-            # If overlaps significantly, merge it
-            if iou > iou_threshold:
-                current_mask = current_mask | binary_masks[j]
-                current_score = max(current_score, scores[j].item())
-                used[j] = True
-
-        merged_masks.append(current_mask)
-        merged_scores.append(current_score)
-        merged_boxes.append(current_box)
-
-    if len(merged_masks) > 0:
-        merged_masks = torch.stack(merged_masks)
-        merged_scores = torch.tensor(merged_scores, device=scores.device)
-        merged_boxes = torch.stack(merged_boxes)
-    else:
-        merged_masks = binary_masks[:0]
-        merged_scores = scores[:0]
-        merged_boxes = boxes[:0]
-
-    return merged_masks, merged_scores, merged_boxes
+from data.vaihingen_dataset import VaiRefDataset
+from data.COCODataset import COCOSegmentDataset, DirectCOCODataset
+from tools.utils import setup_distributed, cleanup_distributed, patch_dynamic_rope
+from tools.utils import merge_overlapping_masks, get_world_size, get_rank, print_rank0
 
 
 def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100):
@@ -362,9 +106,14 @@ def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_
     return filtered_masks, filtered_scores, filtered_boxes
 
 
-def convert_predictions_to_coco_format(predictions_list, image_ids, resolution=288,
-                                       prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100,
-                                       merge_cracks=False, merge_iou_threshold=0.15):
+def convert_predictions_to_coco_format(predictions_list, 
+                                       image_ids, 
+                                       resolution=288,
+                                       prob_threshold=0.3, 
+                                       nms_iou_threshold=0.7, 
+                                       max_detections=100,
+                                       merge_cracks=False, 
+                                       merge_iou_threshold=0.15):
     """
     Convert model predictions to COCO format using SAM3's NMS pipeline.
 
@@ -548,7 +297,16 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     return coco_gt
 
 
-def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
+def convert_predictions_to_coco_format_original_res(
+    predictions_list, 
+    image_ids, 
+    dataset, 
+    model_resolution=288, 
+    score_threshold=0.0, 
+    merge_overlaps=True, 
+    iou_threshold=0.3, 
+    debug=False
+    ):
     """
     Convert model predictions to COCO format at ORIGINAL image resolution.
 
@@ -784,9 +542,109 @@ def move_to_device(obj, device):
     return obj
 
 
+def compute_miou(coco_gt_dict, coco_predictions):
+    """
+    Compute Mean IoU (mIoU) for binary segmentation.
+
+    Builds per-image binary masks from RLE annotations, then computes
+    pixel-level confusion matrix accumulated across all images.
+
+    For binary (crack + background):
+        crack_IoU = TP / (TP + FP + FN)
+        bg_IoU    = TN / (TN + FP + FN)
+        mIoU      = (crack_IoU + bg_IoU) / 2
+
+    Args:
+        coco_gt_dict: COCO ground truth dict with 'images' and 'annotations'
+        coco_predictions: List of COCO prediction dicts
+
+    Returns:
+        dict with keys: miou, iou_object, iou_background, total_tp, total_fp, total_fn, total_tn
+    """
+
+    # Group GT annotations by image_id
+    gt_by_image = {}
+    for ann in coco_gt_dict['annotations']:
+        img_id = ann['image_id']
+        if img_id not in gt_by_image:
+            gt_by_image[img_id] = []
+        gt_by_image[img_id].append(ann)
+
+    # Group predictions by image_id
+    pred_by_image = {}
+    for pred in coco_predictions:
+        img_id = pred['image_id']
+        if img_id not in pred_by_image:
+            pred_by_image[img_id] = []
+        pred_by_image[img_id].append(pred)
+
+    # Image dimensions lookup
+    img_sizes = {img['id']: (img['height'], img['width']) for img in coco_gt_dict['images']}
+
+    # Accumulate confusion matrix
+    total_tp = 0  # object pixels correctly predicted
+    total_fp = 0  # background pixels predicted as object
+    total_fn = 0  # object pixels predicted as background
+    total_tn = 0  # background pixels correctly predicted
+
+    images_processed = 0
+
+    for img_id, (h, w) in tqdm(img_sizes.items(), desc="Computing MIoU"):
+        # Build GT binary mask (union of all object annotations)
+        gt_mask = np.zeros((h, w), dtype=np.uint8)
+        for ann in gt_by_image.get(img_id, []):
+            if 'segmentation' in ann:
+                try:
+                    decoded = mask_utils.decode(ann['segmentation'])
+                    gt_mask = np.logical_or(gt_mask, decoded).astype(np.uint8)
+                except Exception:
+                    pass
+
+        # Build prediction binary mask (union of all predicted objects)
+        pred_mask = np.zeros((h, w), dtype=np.uint8)
+        for pred in pred_by_image.get(img_id, []):
+            if 'segmentation' in pred:
+                try:
+                    decoded = mask_utils.decode(pred['segmentation'])
+                    pred_mask = np.logical_or(pred_mask, decoded).astype(np.uint8)
+                except Exception:
+                    pass
+
+        # Per-pixel metrics
+        intersection = np.logical_and(pred_mask, gt_mask).sum()
+        fp = np.logical_and(pred_mask, np.logical_not(gt_mask)).sum()
+        fn = np.logical_and(np.logical_not(pred_mask), gt_mask).sum()
+        tn = np.logical_and(np.logical_not(pred_mask), np.logical_not(gt_mask)).sum()
+
+        total_tp += intersection
+        total_fp += fp
+        total_fn += fn
+        total_tn += tn
+        images_processed += 1
+
+    # Per-class IoU
+    iou_object = total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) > 0 else 0.0
+    iou_bg = total_tn / (total_tn + total_fp + total_fn) if (total_tn + total_fp + total_fn) > 0 else 0.0
+    miou = (iou_object + iou_bg) / 2.0
+
+    print(f"\n[MIoU] Processed {images_processed} images")
+    print(f"[MIoU] Confusion matrix: TP={total_tp}, FP={total_fp}, FN={total_fn}, TN={total_tn}")
+
+    return {
+        'miou': miou,
+        'iou_object': iou_object,
+        'iou_background': iou_bg,
+        'total_tp': int(total_tp),
+        'total_fp': int(total_fp),
+        'total_fn': int(total_fn),
+        'total_tn': int(total_tn),
+    }
+
+
 def validate(config_path, weights_path, val_data_dir, num_samples=None,
              prob_threshold=0.3, nms_iou=0.7, merge_cracks=False, merge_iou=0.15,
-             use_base_model=False):
+             use_base_model=False, dataset_type="coco",
+             vai_data_dir=None, vai_split="valid", vai_variant="standard"):
     """Run validation with full metrics (mAP, cgF1) and SAM3 NMS
 
     Args:
@@ -821,12 +679,16 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     model = build_sam3_image_model(
         device=device.type,
         compile=False,
-        checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+        checkpoint_path="/home/icclab/Documents/lqw/sam3/weights/sam3.pt",  # 设置直接加载权重
         load_from_HF=False,
-        bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+        bpe_path="/home/icclab/Documents/lqw/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=False
     )
 
+    # Patch RoPE for dynamic resolution support (enables non-1008 inputs)
+    n_patched = patch_dynamic_rope(model)
+    print(f"Dynamic RoPE patch applied to {n_patched} attention layers")
+    
     # Load config for batch_size and other settings
     if use_base_model:
         # Use original SAM3 model without LoRA
@@ -874,56 +736,42 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     model.to(device)
     model.eval()
 
-    # Load validation data directly from the specified directory
-    print(f"\nLoading validation data from {val_data_dir}...")
+    # Load validation data
+    if dataset_type == "vaihingen":
+        if vai_data_dir is None:
+            raise ValueError("vai_data_dir is required when dataset_type='vaihingen'")
+        print(f"\nLoading Vaihingen validation data from {vai_data_dir}...")
+        val_ds = VaiRefDataset(
+            data_dir=vai_data_dir,
+            split=vai_split,
+            variant=vai_variant,
+            resolution=480
+        )
 
-    # Load COCO annotations directly
-    from pathlib import Path
-    ann_file = Path(val_data_dir) / "_annotations.coco.json"
-    if not ann_file.exists():
-        raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
+        # for input_batch in val_ds:
 
-    # Create a simple dataset class that loads from the directory directly
-    class DirectCOCODataset(COCOSegmentDataset):
-        def __init__(self, data_dir):
-            self.data_dir = Path(data_dir)
-            self.split_dir = self.data_dir
+        #     img = input_batch.images[0]
+        #     q = input_batch.find_queries[0]
+        #     obj = img.objects[0]
 
-            # Load COCO annotations
-            ann_file = self.split_dir / "_annotations.coco.json"
-            if not ann_file.exists():
-                raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
+        #     # print(f"\n--- Sample {i} ---")
+        #     print(f"  Image tensor: {img.data.shape}")
+        #     print(f"  Query: {q.query_text[:60]}...")
+        #     print(f"  Mask: {obj.segment.shape}, sum={obj.segment.sum().item():.0f} px")
+        #     print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
+        #     print(f"  Original size: {q.inference_metadata.original_size}")
+    
+    else:
+        print(f"\nLoading validation data from {val_data_dir}...")
 
-            with open(ann_file, 'r') as f:
-                self.coco_data = json.load(f)
+        # Load COCO annotations directly
+        from pathlib import Path
+        ann_file = Path(val_data_dir) / "_annotations.coco.json"
+        if not ann_file.exists():
+            raise FileNotFoundError(f"COCO annotation file not found: {ann_file}")
 
-            # Build index: image_id -> image info
-            self.images = {img['id']: img for img in self.coco_data['images']}
-            self.image_ids = sorted(list(self.images.keys()))
-
-            # Build index: image_id -> list of annotations
-            self.img_to_anns = {}
-            for ann in self.coco_data['annotations']:
-                img_id = ann['image_id']
-                if img_id not in self.img_to_anns:
-                    self.img_to_anns[img_id] = []
-                self.img_to_anns[img_id].append(ann)
-
-            # Load categories
-            self.categories = {cat['id']: cat['name'] for cat in self.coco_data['categories']}
-            print(f"Loaded COCO dataset from {data_dir}")
-            print(f"  Images: {len(self.image_ids)}")
-            print(f"  Annotations: {len(self.coco_data['annotations'])}")
-            print(f"  Categories: {self.categories}")
-
-            self.resolution = 1008
-            self.transform = v2.Compose([
-                v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ])
-
-    val_ds = DirectCOCODataset(val_data_dir)
+        # Create a simple dataset class that loads from the directory directly
+        val_ds = DirectCOCODataset(val_data_dir)
 
     if num_samples:
         print(f"\n[INFO] Limiting validation to {num_samples} samples for debugging")
@@ -950,12 +798,16 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     print("RUNNING VALIDATION")
     print("="*80)
 
-    all_predictions = []
     all_image_ids = []
-    val_losses = []
+    all_coco_predictions = []
+    CHUNK_SIZE = 100  # Process 100 images per chunk to limit memory
+    first_batch_scores = None  # For debug when no predictions survive NMS
 
     # Use automatic mixed precision for faster inference
     use_amp = device.type == 'cuda'
+
+    chunk_predictions = []
+    chunk_image_ids = []
 
     with torch.no_grad():
         for batch_idx, batch_dict in enumerate(tqdm(val_loader, desc="Validation")):
@@ -964,7 +816,6 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
 
             input_batch = batch_dict["input"]
             input_batch = move_to_device(input_batch, device)
-
             # Forward pass with optional AMP
             if use_amp:
                 with torch.cuda.amp.autocast():
@@ -984,63 +835,106 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                 for i in range(batch_size_actual):
                     img_id = batch_idx * batch_size + i
                     all_image_ids.append(img_id)
-                    all_predictions.append({
+                    chunk_image_ids.append(img_id)
+                    chunk_predictions.append({
                         'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
                         'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
                         'pred_masks': final_outputs['pred_masks'][i].detach().cpu()
                     })
 
-    print(f"\nCollected predictions for {len(all_predictions)} images")
+                # Capture first batch scores for debug
+                if batch_idx == 0:
+                    first_batch_scores = torch.sigmoid(final_outputs['pred_logits'].detach().cpu())
+
+            # Free GPU memory from this batch
+            del input_batch, outputs_list, final_outputs, batch_dict
+
+            # Flush chunk to compact COCO format to avoid accumulating raw tensors
+            if len(chunk_predictions) >= CHUNK_SIZE:
+                chunk_coco = convert_predictions_to_coco_format_original_res(
+                    chunk_predictions, 
+                    chunk_image_ids,
+                    val_ds,
+                    score_threshold=prob_threshold,
+                    iou_threshold=merge_iou,
+                    )
+                # chunk_coco = convert_predictions_to_coco_format(
+                #     chunk_predictions, chunk_image_ids,
+                #     resolution=288,
+                #     prob_threshold=prob_threshold,
+                #     nms_iou_threshold=nms_iou,
+                #     max_detections=100,
+                #     merge_cracks=merge_cracks,
+                #     merge_iou_threshold=merge_iou
+                # )
+                all_coco_predictions.extend(chunk_coco)
+                del chunk_predictions, chunk_image_ids, chunk_coco
+                chunk_predictions = []
+                chunk_image_ids = []
+                torch.cuda.empty_cache()
+                gc.collect()
+
+    # Flush remaining predictions
+    if chunk_predictions:
+        chunk_coco = convert_predictions_to_coco_format_original_res(
+            chunk_predictions, 
+            chunk_image_ids,
+            val_ds,
+            score_threshold=prob_threshold,
+            iou_threshold=merge_iou,
+            )
+        # chunk_coco = convert_predictions_to_coco_format(
+        #     chunk_predictions, chunk_image_ids,
+        #     resolution=288,
+        #     prob_threshold=prob_threshold,
+        #     nms_iou_threshold=nms_iou,
+        #     max_detections=100,
+        #     merge_cracks=merge_cracks,
+        #     merge_iou_threshold=merge_iou
+        # )
+        all_coco_predictions.extend(chunk_coco)
+        del chunk_predictions, chunk_image_ids, chunk_coco
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    coco_predictions = all_coco_predictions
+    del all_coco_predictions
+    print(f"\n[INFO] Collected {len(coco_predictions)} COCO-format predictions from {len(all_image_ids)} images")
+
+    # If no predictions survived thresholding, analyze first batch scores for debugging
+    if len(coco_predictions) == 0 and first_batch_scores is not None:
+        print(f"\n[DEBUG] No predictions after NMS — analyzing first batch scores...")
+        scores = first_batch_scores.squeeze(-1)
+        print(f"[DEBUG] Raw pred_logits shape: {first_batch_scores.shape}")
+        print(f"[DEBUG] Sigmoid scores: min={scores.min().item():.6f}, "
+              f"max={scores.max().item():.6f}, "
+              f"mean={scores.mean().item():.6f}")
+        print(f"[DEBUG] Median score: {scores.median().item():.6f}")
+        print(f"[DEBUG] Fraction > 0.1: {(scores > 0.1).float().mean().item():.3f}")
+        print(f"[DEBUG] Fraction > 0.3: {(scores > 0.3).float().mean().item():.3f}")
+        print(f"[INFO] Try: --prob-threshold 0.05 or 0.1")
+        del first_batch_scores
 
     # Compute metrics
     print("\n" + "="*80)
     print("COMPUTING METRICS")
     print("="*80)
 
-    # Create COCO ground truth (downsampled to 288×288 - fast!)
+    # Create COCO ground truth (downsampled to 288×288)
     print(f"\n[INFO] Creating ground truth from validation dataset...")
-    coco_gt_dict = create_coco_gt_from_dataset(
-        val_ds,
-        image_ids=all_image_ids,
-        mask_resolution=288
-    )
-    
+    coco_gt_dict = create_coco_gt_from_dataset_original_res(val_ds)
+    # coco_gt_dict = create_coco_gt_from_dataset(
+    #     val_ds,
+    #     image_ids=all_image_ids,
+    #     mask_resolution=288
+    # )
+
     # Filter predictions to only include images that exist in the ground truth
-    print(f"\n[INFO] Filtering predictions to match ground truth images...")
     gt_image_ids = set(img['id'] for img in coco_gt_dict['images'])
-    filtered_predictions = []
-    filtered_image_ids = []
-    
-    for img_id, preds in zip(all_image_ids, all_predictions):
-        if img_id in gt_image_ids:
-            filtered_predictions.append(preds)
-            filtered_image_ids.append(img_id)
-        else:
-            print(f"[INFO] Skipping predictions for image {img_id} (not in ground truth)")
-    
-    print(f"[INFO] Filtered {len(all_predictions)} -> {len(filtered_predictions)} predictions")
-
-    # Check prediction scores (optional - can be commented out for speed)
-    # print(f"\n[INFO] Analyzing prediction scores...")
-    # all_scores = []
-    # for p in all_predictions:
-    #     if 'pred_logits' in p and len(p['pred_logits']) > 0:
-    #         scores = torch.sigmoid(p['pred_logits']).squeeze(-1)
-    #         all_scores.extend(scores.tolist())
-    # if all_scores:
-    #     print(f"[INFO] Prediction scores: min={min(all_scores):.4f}, max={max(all_scores):.4f}, mean={np.mean(all_scores):.4f}")
-
-    # Convert predictions using SAM3's NMS pipeline or crack merging
-    coco_predictions = convert_predictions_to_coco_format(
-        filtered_predictions,
-        filtered_image_ids,
-        resolution=288,
-        prob_threshold=prob_threshold,
-        nms_iou_threshold=nms_iou,
-        max_detections=100,
-        merge_cracks=merge_cracks,
-        merge_iou_threshold=merge_iou
-    )
+    filtered_predictions = [p for p in coco_predictions if p['image_id'] in gt_image_ids]
+    if len(filtered_predictions) < len(coco_predictions):
+        print(f"[INFO] Skipped {len(coco_predictions) - len(filtered_predictions)} predictions with no GT")
+    coco_predictions = filtered_predictions
 
     if merge_cracks:
         print(f"\n[INFO] Total predictions after CRACK MERGING: {len(coco_predictions)}")
@@ -1048,6 +942,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
 
     if len(coco_predictions) > 0:
+        print("here is true, we went into coco_predictions")
         # Save temporary files for COCO evaluation
         import tempfile
         import os
@@ -1099,6 +994,13 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         cgf1_50 = cgf1_results.get('cgF1_eval_segm_cgF1@0.5', 0.0)
         cgf1_75 = cgf1_results.get('cgF1_eval_segm_cgF1@0.75', 0.0)
 
+        # Compute MIoU (pixel-level Mean IoU)
+        print("\n" + "="*80)
+        print("MIoU EVALUATION (Pixel-Level)")
+        print("="*80)
+
+        miou_results = compute_miou(coco_gt_dict, coco_predictions)
+
         # Print summary
         print("\n" + "="*80)
         print("FINAL RESULTS")
@@ -1109,6 +1011,10 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"cgF1 (IoU 0.50:0.95): {cgf1:.4f}")
         print(f"cgF1@50: {cgf1_50:.4f}")
         print(f"cgF1@75: {cgf1_75:.4f}")
+        print(f"---")
+        print(f"mIoU: {miou_results['miou']:.4f}")
+        print(f"IoU (object): {miou_results['iou_object']:.4f}")
+        print(f"IoU (background): {miou_results['iou_background']:.4f}")
         print("="*80)
 
         # Cleanup temporary files
@@ -1141,7 +1047,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val_data_dir",
         type=str,
-        required=True,
+        # required=True,
+        default=None,
         help="Direct path to validation data directory containing _annotations.coco.json (e.g., /workspace/data2/valid)"
     )
     parser.add_argument(
@@ -1178,6 +1085,33 @@ if __name__ == "__main__":
         default=0.15,
         help="IoU threshold for merging overlapping predictions (default: 0.15, lower = more aggressive)"
     )
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        default="coco",
+        choices=["coco", "vaihingen"],
+        help="Dataset type: 'coco' (COCO format) or 'vaihingen' (VaihingenRef)"
+    )
+    parser.add_argument(
+        "--vai-data-dir",
+        type=str,
+        default=None,
+        help="Path to VaihingenRef dataset root (required when --dataset-type=vaihingen)"
+    )
+    parser.add_argument(
+        "--vai-split",
+        type=str,
+        default="valid",
+        choices=["train", "valid", "test"],
+        help="Vaihingen dataset split (default: valid)"
+    )
+    parser.add_argument(
+        "--vai-variant",
+        type=str,
+        default="standard",
+        choices=["concept", "simple", "standard", "complex"],
+        help="Vaihingen text variant (default: standard)"
+    )
     args = parser.parse_args()
 
     # Validate argument combinations
@@ -1194,5 +1128,16 @@ if __name__ == "__main__":
         nms_iou=args.nms_iou,
         merge_cracks=args.merge,
         merge_iou=args.merge_iou,
-        use_base_model=args.use_base_model
+        use_base_model=args.use_base_model,
+        dataset_type=args.dataset_type,
+        vai_data_dir=args.vai_data_dir,
+        vai_split=args.vai_split,
+        vai_variant=args.vai_variant,
     )
+
+
+
+# python scripts/inference/validate_sam3_lora.py --config configs/vaihingen_lora_config.yaml --weights /home/icclab/Documents/lqw/sam3/weights/sam3.pt --dataset-type vaihingen --vai-data-dir /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef --vai-split valid --vai-variant concept --prob-threshold 0.1
+# python scripts/inference/validate_sam3_lora.py --config configs/vaihingen_lora_config.yaml --weights outputs/sam3_lora_vaihingen/best_lora_weights.pt --dataset-type vaihingen --vai-data-dir /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef --vai-split valid --vai-variant concept
+# python scripts/inference/validate_sam3_lora.py --config configs/vaihingen_lora_config.yaml --weights outputs/sam3_lora_vaihingen_simple/best_lora_weights.pt --dataset-type vaihingen --vai-data-dir /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef --vai-split valid --vai-variant simple --prob-threshold 0.1
+# python scripts/inference/validate_sam3_lora.py --config configs/vaihingen_lora_config.yaml --weights outputs/sam3_lora_vaihingen_stand/best_lora_weights.pt --dataset-type vaihingen --vai-data-dir /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef --vai-split valid --vai-variant standard

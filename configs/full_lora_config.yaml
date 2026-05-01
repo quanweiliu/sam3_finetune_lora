@@ -62,7 +62,7 @@ lora:
 
 # Training settings
 training:
-  data_dir: "/workspace/data"  # Root directory containing train/valid/test folders with COCO annotations
+  data_dir: "/home/icclab/Documents/lqw/DatasetMMF/crackDetection"  # Root directory containing train/valid/test folders with COCO annotations
   batch_size: 4      # Increased from 1 to reduce gradient variance
   num_workers: 2        # Increase for better data loading
 

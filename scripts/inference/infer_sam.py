@@ -21,12 +21,19 @@ Usage:
         --output output.png
 """
 
-import argparse
 import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, [1]))
+print('using GPU %s' % ','.join(map(str, [1])))
+
 import sys
+# Add project root and training directory for local imports
+_SCRIPT_DIR = os.path.dirname(__file__)
+sys.path.append(os.path.join(_SCRIPT_DIR, "../.."))
+sys.path.append(os.path.join(_SCRIPT_DIR, "../training"))
+
+import argparse
 from pathlib import Path
 from typing import List, Optional
-
 import torch
 import numpy as np
 from PIL import Image as PILImage
@@ -56,6 +63,9 @@ from sam3.eval.postprocessors import PostProcessImage
 # LoRA imports
 from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
 
+from data.vaihingen_dataset import VaiRefDataset
+from data.COCODataset import COCOSegmentDataset, DirectCOCODataset
+from tools.utils import setup_distributed, cleanup_distributed, patch_dynamic_rope
 
 class SAM3LoRAInference:
     """SAM3 model with LoRA for inference."""
@@ -110,12 +120,19 @@ class SAM3LoRAInference:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+            # checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
+            checkpoint_path="/home/icclab/Documents/lqw/sam3/weights/sam3.pt",  # 设置直接加载权重
+            # checkpoint_path="/home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen/best_lora_weights.pt",  # 设置直接加载权重
             load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
-            bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+            # bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+            bpe_path="/home/icclab/Documents/lqw/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=True
         )
 
+        # Patch RoPE for dynamic resolution support (enables non-1008 inputs)
+        n_patched = patch_dynamic_rope(self.model)
+        print(f"Dynamic RoPE patch applied to {n_patched} attention layers")
+        
         # Apply LoRA configuration
         print("🔗 Applying LoRA configuration...")
         lora_cfg = self.config["lora"]
@@ -483,7 +500,7 @@ def main():
     parser.add_argument(
         "--resolution",
         type=int,
-        default=1008,
+        default=480,
         help="Input resolution (default: 1008)"
     )
     parser.add_argument(
@@ -539,3 +556,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+# python3 scripts/inference/infer_sam.py --config configs/vaihingen_lora_config.yaml --weights outputs/sam3_lora_vaihingen/best_lora_weights.pt --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_0.tif --prompt "building"
+# python3 scripts/inference/infer_sam.py --config configs/vaihingen_lora_config.yaml --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_0.tif --prompt "building"

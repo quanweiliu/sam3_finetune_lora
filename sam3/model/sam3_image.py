@@ -530,12 +530,23 @@ class Sam3Image(torch.nn.Module):
     def forward(self, input: BatchedDatapoint):
         device = self.device
         backbone_out = {"img_batch_all_stages": input.img_batch}
-        backbone_out.update(self.backbone.forward_image(input.img_batch))
+
+        # 输入是 torch.Size([2, 3, 1008, 1008])
+        img_encoder_out = self.backbone.forward_image(input.img_batch)
+        # print("img_encoder_out", img_encoder_out.keys()) 
+        # 'vision_features', 'vision_pos_enc', 'backbone_fpn', 'sam2_backbone_out'
+        backbone_out.update(img_encoder_out)
         num_frames = len(input.find_inputs)
         assert num_frames == 1
 
         text_outputs = self.backbone.forward_text(input.find_text_batch, device=device)
+        # print("text_outputs", text_outputs.keys())
+        # 'language_features', 'language_mask', 'language_embeds'
         backbone_out.update(text_outputs)
+        # print("backbone_out keys:", backbone_out.keys())
+        # dict_keys(['img_batch_all_stages', 'vision_features', 'vision_pos_enc', \
+        # 'backbone_fpn', 'sam2_backbone_out', 'language_features', 'language_mask', \
+        # 'language_embeds'])
 
         previous_stages_out = SAM3Output(
             iter_mode=SAM3Output.IterMode.LAST_STEP_PER_STAGE
@@ -881,3 +892,6 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         output_list = [torch.empty_like(x) for _ in range(self.world_size)]
         handle = torch.distributed.all_gather(output_list, x, async_op=async_op)
         return output_list, handle
+
+
+# python scripts/training/train_sam3_lora_native.py --config configs/full_lora_config.yaml
