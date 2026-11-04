@@ -6,8 +6,8 @@ model:
 
 # LoRA settings
 lora:
-  rank: 16  # 32
-  alpha: 64 # 
+  rank: 8  # 32
+  alpha: 16 # 64
   dropout: 0.5 # 0.1
 
   target_modules:
@@ -32,11 +32,12 @@ lora:
   apply_to_mask_decoder: true
 
 training:
-  dataset: "vaihingen"              # Use VaihingenRef dataset (instead of COCO)
-  data_dir: "/home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/"
-  variant: "concept"                # “concept”， “simple”, "standard" or "complex" text descriptions
+  dataset: "isprsRef"              # Use VaihingenRef dataset (instead of COCO)
+  # data_dir: "/home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/"
+  data_dir: "/home/icclab/Documents/lqw/DatasetMMF/VaihingenRef_v2/"
+  variant: "standard"                # concept, simple, standard or complex text descriptions
 
-  batch_size: 8
+  batch_size: 16
   num_workers: 8
 
   learning_rate: 5e-5
@@ -46,7 +47,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 100
+  num_epochs: 10
   warmup_steps: 200
   lr_scheduler: "cosine"
 
@@ -60,7 +61,7 @@ training:
   gradient_accumulation_steps: 8
 
 output:
-  output_dir: "outputs/sam3_lora_vaihingen"
+  output_dir: "outputs/sam3_lora_vaihingen_standard"
   logging_dir: "logs"
   save_lora_only: true
   push_to_hub: false

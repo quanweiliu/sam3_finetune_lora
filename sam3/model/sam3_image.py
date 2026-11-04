@@ -530,8 +530,9 @@ class Sam3Image(torch.nn.Module):
     def forward(self, input: BatchedDatapoint):
         device = self.device
         backbone_out = {"img_batch_all_stages": input.img_batch}
+        # print("input.img_batch.shape", input.img_batch.shape)  # torch.Size([2, 3, 480, 480])
 
-        # 输入是 torch.Size([2, 3, 1008, 1008])
+        # 输入是 torch.Size([2, 3, 480, 480])
         img_encoder_out = self.backbone.forward_image(input.img_batch)
         # print("img_encoder_out", img_encoder_out.keys()) 
         # 'vision_features', 'vision_pos_enc', 'backbone_fpn', 'sam2_backbone_out'

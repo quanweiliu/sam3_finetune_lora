@@ -30,8 +30,10 @@ import sys
 _SCRIPT_DIR = os.path.dirname(__file__)
 sys.path.append(os.path.join(_SCRIPT_DIR, "../.."))
 sys.path.append(os.path.join(_SCRIPT_DIR, "../training"))
+sys.path.append("/home/icclab/Documents/lqw/sam3_finetune_lora/scripts")
 
 import argparse
+import yaml
 from pathlib import Path
 from typing import List, Optional
 import torch
@@ -39,7 +41,6 @@ import numpy as np
 from PIL import Image as PILImage
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import yaml
 from torchvision.ops import nms
 
 # SAM3 imports
@@ -63,7 +64,7 @@ from sam3.eval.postprocessors import PostProcessImage
 # LoRA imports
 from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights
 
-from data.vaihingen_dataset import VaiRefDataset
+from data.isprs_dataset import ISPRSRefDataset
 from data.COCODataset import COCOSegmentDataset, DirectCOCODataset
 from tools.utils import setup_distributed, cleanup_distributed, patch_dynamic_rope
 
@@ -77,7 +78,8 @@ class SAM3LoRAInference:
         resolution: int = 1008,
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
-        device: str = "cuda"
+        device: str = "cuda",
+        use_base_model=False,
     ):
         """
         Initialize SAM3 with LoRA.
@@ -120,11 +122,8 @@ class SAM3LoRAInference:
         self.model = build_sam3_image_model(
             device=self.device.type,
             compile=False,
-            # checkpoint_path="/root/autodl-tmp/sam3_checkpoint/sam3.pt",  # 设置直接加载权重
-            checkpoint_path="/home/icclab/Documents/lqw/sam3/weights/sam3.pt",  # 设置直接加载权重
-            # checkpoint_path="/home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen/best_lora_weights.pt",  # 设置直接加载权重
+            checkpoint_path="/home/icclab/Documents/lqw/sam3/weights/sam3.pt", 
             load_from_HF=False,  # Tries to download from HF if checkpoint_path is None
-            # bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             bpe_path="/home/icclab/Documents/lqw/sam3/assets/bpe_simple_vocab_16e6.txt.gz",
             eval_mode=True
         )
@@ -133,26 +132,29 @@ class SAM3LoRAInference:
         n_patched = patch_dynamic_rope(self.model)
         print(f"Dynamic RoPE patch applied to {n_patched} attention layers")
         
-        # Apply LoRA configuration
-        print("🔗 Applying LoRA configuration...")
-        lora_cfg = self.config["lora"]
-        lora_config = LoRAConfig(
-            rank=lora_cfg["rank"],
-            alpha=lora_cfg["alpha"],
-            dropout=0.0,  # No dropout during inference
-            target_modules=lora_cfg["target_modules"],
-            apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
-            apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
-            apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
-            apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
-            apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
-            apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
-        )
-        self.model = apply_lora_to_model(self.model, lora_config)
+        if use_base_model:
+            print("Using original SAM3 model (no LoRA)")
+        else:
+            # Apply LoRA configuration
+            print("🔗 Applying LoRA configuration...")
+            lora_cfg = self.config["lora"]
+            lora_config = LoRAConfig(
+                rank=lora_cfg["rank"],
+                alpha=lora_cfg["alpha"],
+                dropout=0.0,  # No dropout during inference
+                target_modules=lora_cfg["target_modules"],
+                apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
+                apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
+                apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
+                apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
+                apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
+                apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
+            )
+            self.model = apply_lora_to_model(self.model, lora_config)
 
-        # Load LoRA weights
-        print(f"💾 Loading LoRA weights from {weights_path}...")
-        load_lora_weights(self.model, weights_path)
+            # Load LoRA weights
+            print(f"💾 Loading LoRA weights from {weights_path}...")
+            load_lora_weights(self.model, weights_path)
 
         self.model.to(self.device)
         self.model.eval()
@@ -460,23 +462,37 @@ class SAM3LoRAInference:
 
 def main():
     parser = argparse.ArgumentParser(description="SAM3 + LoRA Inference")
+
     parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to training config YAML"
-    )
-    parser.add_argument(
-        "--weights",
+        "--file_path",
         type=str,
         default=None,
-        help="Path to LoRA weights (auto-detected if not provided)"
+        help="Path to config file (for LoRA settings). Not required if --use-base-model is set."
     )
+
+    # parser.add_argument(
+    #     "--config",
+    #     type=str,
+    #     required=True,
+    #     help="Path to training config YAML"
+    # )
+    # parser.add_argument(
+    #     "--weights",
+    #     type=str,
+    #     default=None,
+    #     help="Path to LoRA weights (auto-detected if not provided)"
+    # )
+
     parser.add_argument(
         "--image",
         type=str,
         required=True,
         help="Path to input image"
+    )
+    parser.add_argument(
+        "--use-base-model",
+        action="store_true",
+        help="Use original SAM3 model without LoRA (for baseline comparison)"
     )
     parser.add_argument(
         "--prompt",
@@ -488,7 +504,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="output.png",
+        # default="output.png",
+        default="/home/icclab/Documents/lqw/sam3_finetune_lora/asset",
         help="Output visualization path"
     )
     parser.add_argument(
@@ -522,6 +539,8 @@ def main():
     )
 
     args = parser.parse_args()
+    args.config = os.path.join(args.file_path, "config.yaml")
+    args.weights = os.path.join(args.file_path, "best_lora_weights.pt")
 
     # Initialize model
     inferencer = SAM3LoRAInference(
@@ -529,13 +548,16 @@ def main():
         weights_path=args.weights,
         resolution=args.resolution,
         detection_threshold=args.threshold,
-        nms_iou_threshold=args.nms_iou
+        nms_iou_threshold=args.nms_iou,
+        use_base_model=args.use_base_model,
     )
 
     # Run inference
     results = inferencer.predict(args.image, args.prompt)
 
     # Visualize
+    args.output = os.path.join(args.output, args.image.split('/')[-1] + "_" + "_".join(args.prompt) + ".png")
+    # print(args.image.split('/')[-1], args.output)
     inferencer.visualize(
         results,
         args.output,
@@ -559,6 +581,14 @@ if __name__ == "__main__":
 
 
 
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_0.tif --prompt "building" --use-base-model
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_445.tif --prompt "car" --use-base-model
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_445.tif --prompt "Paved surface" --use-base-model
 
-# python3 scripts/inference/infer_sam.py --config configs/vaihingen_lora_config.yaml --weights outputs/sam3_lora_vaihingen/best_lora_weights.pt --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_0.tif --prompt "building"
-# python3 scripts/inference/infer_sam.py --config configs/vaihingen_lora_config.yaml --image /home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/images/test_0.tif --prompt "building"
+
+
+
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen_standard_newSet --image /home/icclab/Documents/lqw/sam3_finetune_lora/asset/images/test_60.tif --prompt "Moderate partially shown wooded patch scattered across all sectors, adjacent to the paved surface."
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen_standard_newSet --image /home/icclab/Documents/lqw/sam3_finetune_lora/asset/images/test_464.tif --prompt "A small group of partially shown detached houses is scattered across the tile alongside the road intersection."
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen_standard_newSet --image /home/icclab/Documents/lqw/sam3_finetune_lora/asset/images/test_856.tif --prompt "A large number of partially shown cars scattered across all zones alongside the road intersection."
+# python scripts/inference/isprs_vis.py --file_path /home/icclab/Documents/lqw/sam3_finetune_lora/outputs/sam3_lora_vaihingen_standard_newSet --image /home/icclab/Documents/lqw/sam3_finetune_lora/asset/images/test_1400.tif --prompt "An extensive road intersection diagonally traversing from top-left to bottom-right, bordering a large building section."

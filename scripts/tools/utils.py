@@ -2,9 +2,11 @@
 import os
 import torch
 import numpy as np
+from tqdm import tqdm
 import torch.distributed as dist
 import pycocotools.mask as mask_utils  # Required for RLE mask decoding in COCO dataset
 from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
+from sam3.perflib.nms import nms_masks
 
 
 def patch_dynamic_rope(model):
@@ -192,6 +194,44 @@ def merge_overlapping_masks(
     scores = scores[sorted_indices]
     boxes = boxes[sorted_indices]
 
+    if binary_masks.device.type == "cpu":
+        # Avoid launching threaded tensor reductions for every pair of masks.
+        # Keep the same greedy order, including updates to each merged mask.
+        masks_np = binary_masks.numpy()
+        areas = np.count_nonzero(masks_np, axis=(1, 2))
+        used = np.zeros(len(masks_np), dtype=bool)
+        merged_masks, merged_scores, merged_boxes = [], [], []
+
+        for i in range(len(masks_np)):
+            if used[i]:
+                continue
+            current_mask = masks_np[i].copy()
+            current_area = int(areas[i])
+            current_score = scores[i].item()
+            used[i] = True
+
+            for j in range(i + 1, len(masks_np)):
+                if used[j]:
+                    continue
+                intersection = np.count_nonzero(current_mask & masks_np[j])
+                union = current_area + int(areas[j]) - intersection
+                iou = intersection / union if union > 0 else 0
+                if iou > iou_threshold:
+                    np.logical_or(current_mask, masks_np[j], out=current_mask)
+                    current_area = union
+                    current_score = max(current_score, scores[j].item())
+                    used[j] = True
+
+            merged_masks.append(current_mask)
+            merged_scores.append(current_score)
+            merged_boxes.append(boxes[i])
+
+        return (
+            torch.from_numpy(np.stack(merged_masks)),
+            torch.tensor(merged_scores, device=scores.device),
+            torch.stack(merged_boxes),
+        )
+
     merged_masks = []
     merged_scores = []
     merged_boxes = []
@@ -238,112 +278,294 @@ def merge_overlapping_masks(
     return merged_masks, merged_scores, merged_boxes
 
 
-def convert_predictions_to_coco_format(
-    predictions_list,
-    image_ids,
-    resolution=288,
-    score_threshold=0.0,
-    merge_overlaps=True,
-    iou_threshold=0.3,
-    debug=False,
-):
+# def convert_predictions_to_coco_format(
+#         predictions_list,
+#         image_ids,
+#         resolution=288,
+#         score_threshold=0.0,
+#         merge_overlaps=True,
+#         iou_threshold=0.3,
+#         debug=False,
+# ):
+#     """
+#     将模型预测结果转换为 COCO 格式。
+
+#     优化策略：掩码保持在模型原生输出分辨率 (288x288)，对应的 Ground Truth 也会被降采样，
+#     这样可以显著加快计算速度，无需进行大图上采样。
+
+#     参数:
+#         predictions_list (list): 模型输出的预测字典列表。
+#         image_ids (list): 与预测对应的图像 ID 列表。
+#         resolution (int, 可选): 掩码分辨率，默认 288。
+#         score_threshold (float, 可选): 置信度阈值。
+#         merge_overlaps (bool, 可选): 是否合并重叠预测，默认 True。
+#         iou_threshold (float, 可选): 合并 IoU 阈值，默认 0.3。
+#         debug (bool, 可选): 是否打印调试信息。
+
+#     返回:
+#         list: COCO 格式的预测字典列表。
+#     """
+#     coco_predictions = []
+#     pred_id = 0
+
+#     for img_id, preds in zip(image_ids, predictions_list):
+#         if preds is None or len(preds.get("pred_logits", [])) == 0:
+#             continue
+
+#         # 提取预测结果
+#         logits = preds["pred_logits"]  # [num_queries, 1]
+#         boxes = preds["pred_boxes"]  # [num_queries, 4]
+#         masks = preds["pred_masks"]  # [num_queries, H, W]
+
+#         scores = torch.sigmoid(logits).squeeze(-1)  # [num_queries]
+
+#         # 按置信度阈值过滤
+#         valid_mask = scores > score_threshold
+#         num_before = len(scores)
+#         scores = scores[valid_mask]
+#         boxes = boxes[valid_mask]
+#         masks = masks[valid_mask]
+
+#         if debug and img_id == image_ids[0]:  # 仅对首张图进行调试打印
+#             print(
+#                 f"  图像 {img_id}: {num_before} 个查询 -> 过滤后剩余 {len(scores)} 个 (阈值={score_threshold})"
+#             )
+
+#         # 转换为二值掩码
+#         binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
+
+#         # 合并重叠预测，避免过度分割惩罚
+#         if merge_overlaps and len(binary_masks) > 0:
+#             num_before_merge = len(binary_masks)
+#             binary_masks, scores, boxes = merge_overlapping_masks(
+#                 binary_masks, 
+#                 scores.cpu(), 
+#                 boxes.cpu(), 
+#                 iou_threshold=iou_threshold
+#             )
+#             if debug and img_id == image_ids[0]:
+#                 print(
+#                     f"  合并前 {num_before_merge} 个 -> 合并后 {len(binary_masks)} 个 (IoU 阈值={iou_threshold})"
+#                 )
+
+#         # 编码为 RLE (原生分辨率下非常快)
+#         if len(binary_masks) > 0:
+#             mask_areas = binary_masks.flatten(1).sum(1)
+
+#             if debug and img_id == image_ids[0]:
+#                 print(f"  掩码形状: {binary_masks.shape}")
+#                 print(
+#                     f"  面积统计: 最小={mask_areas.min():.0f}, 最大={mask_areas.max():.0f}, 平均={mask_areas.float().mean():.0f}"
+#                 )
+
+#             rles = rle_encode(binary_masks)
+
+#             for _idx, (rle, score, box) in enumerate(
+#                 zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())
+#             ):
+#                 # 将归一化的 CxCyWH 转换为像素坐标下的 [x, y, w, h]
+#                 cx, cy, w, h = box
+#                 x = (cx - w / 2) * resolution
+#                 y = (cy - h / 2) * resolution
+#                 w = w * resolution
+#                 h = h * resolution
+
+#                 coco_predictions.append(
+#                     {
+#                         "image_id": int(img_id),
+#                         "category_id": 1,
+#                         "segmentation": rle,
+#                         "bbox": [float(x), float(y), float(w), float(h)],
+#                         "score": float(score),
+#                         "id": pred_id,
+#                     }
+#                 )
+#                 pred_id += 1
+
+#     return coco_predictions
+
+
+
+def apply_sam3_nms(pred_logits, pred_masks, pred_boxes, prob_threshold=0.3, nms_iou_threshold=0.7, max_detections=100):
     """
-    将模型预测结果转换为 COCO 格式。
+    Apply SAM3's standard NMS pipeline to filter predictions.
 
-    优化策略：掩码保持在模型原生输出分辨率 (288x288)，对应的 Ground Truth 也会被降采样，
-    这样可以显著加快计算速度，无需进行大图上采样。
+    Args:
+        pred_logits: [N, 1] logits
+        pred_masks: [N, H, W] mask logits
+        pred_boxes: [N, 4] boxes in normalized format
+        prob_threshold: Score threshold for filtering (default: 0.3, SAM3 uses 0.5)
+        nms_iou_threshold: IoU threshold for NMS (default: 0.7, SAM3 uses 0.5-0.7)
+        max_detections: Maximum detections to keep (default: 100)
 
-    参数:
-        predictions_list (list): 模型输出的预测字典列表。
-        image_ids (list): 与预测对应的图像 ID 列表。
-        resolution (int, 可选): 掩码分辨率，默认 288。
-        score_threshold (float, 可选): 置信度阈值。
-        merge_overlaps (bool, 可选): 是否合并重叠预测，默认 True。
-        iou_threshold (float, 可选): 合并 IoU 阈值，默认 0.3。
-        debug (bool, 可选): 是否打印调试信息。
+    Returns:
+        Tuple of (filtered_masks, filtered_scores, filtered_boxes)
+    """
+    if len(pred_logits) == 0:
+        return pred_masks[:0], pred_logits[:0].squeeze(-1), pred_boxes[:0]
 
-    返回:
-        list: COCO 格式的预测字典列表。
+    # Convert logits to probabilities
+    pred_probs = torch.sigmoid(pred_logits).squeeze(-1)  # [N]
+
+    # Convert mask logits to binary masks (sigmoid + threshold)
+    pred_masks_sigmoid = torch.sigmoid(pred_masks)  # [N, H, W]
+    pred_masks_binary = pred_masks_sigmoid > 0.5  # [N, H, W]
+
+    # Apply SAM3's NMS
+    # nms_masks expects: pred_probs [N], pred_masks [N, H, W], prob_threshold, iou_threshold
+    # Returns: keep mask [N] of booleans
+    keep_mask = nms_masks(
+        pred_probs=pred_probs,
+        pred_masks=pred_masks_binary.float(),  # NMS expects float masks
+        prob_threshold=prob_threshold,
+        iou_threshold=nms_iou_threshold
+    )
+
+    # Filter predictions
+    filtered_masks = pred_masks_sigmoid[keep_mask]  # Keep sigmoid masks for later
+    filtered_scores = pred_probs[keep_mask]
+    filtered_boxes = pred_boxes[keep_mask]
+
+    # Top-K selection by score
+    if max_detections > 0 and len(filtered_scores) > max_detections:
+        top_k_scores, top_k_indices = torch.topk(filtered_scores, k=max_detections, largest=True)
+        filtered_masks = filtered_masks[top_k_indices]
+        filtered_scores = top_k_scores
+        filtered_boxes = filtered_boxes[top_k_indices]
+
+    return filtered_masks, filtered_scores, filtered_boxes
+
+
+def convert_predictions_to_coco_format(
+        predictions_list, 
+        image_ids, 
+        resolution=288,
+        prob_threshold=0.3, 
+        nms_iou_threshold=0.7, 
+        max_detections=100,
+        merge_cracks=False, 
+        merge_iou_threshold=0.15,
+        debug=False,
+        ):
+    """
+    Convert model predictions to COCO format using SAM3's NMS pipeline.
+
+    Args:
+        predictions_list: List of predictions per image
+        image_ids: List of image IDs
+        resolution: Resolution for box scaling (default: 288)
+        prob_threshold: Score threshold (default: 0.3, SAM3 uses 0.5)
+        nms_iou_threshold: NMS IoU threshold (default: 0.7)
+        max_detections: Max detections per image (default: 100)
+        merge_cracks: If True, merge overlapping segments instead of NMS suppression (default: False)
+        merge_iou_threshold: IoU threshold for merging (default: 0.15, lower = more aggressive)
     """
     coco_predictions = []
     pred_id = 0
 
+    if merge_cracks:
+        print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
+        print(f"[INFO] Using CRACK MERGING mode: prob_threshold={prob_threshold}, merge_iou={merge_iou_threshold}, max_dets={max_detections}")
+        print(f"[INFO] This will MERGE overlapping crack segments instead of suppressing them")
+    else:
+        print(f"\n[INFO] Converting {len(predictions_list)} predictions to COCO format...")
+        print(f"[INFO] Using SAM3 NMS: prob_threshold={prob_threshold}, nms_iou={nms_iou_threshold}, max_dets={max_detections}")
+
+    # for img_id, preds in tqdm(zip(image_ids, predictions_list), \
+    #                           total=len(predictions_list), desc="Converting predictions"):
     for img_id, preds in zip(image_ids, predictions_list):
-        if preds is None or len(preds.get("pred_logits", [])) == 0:
+        if preds is None or len(preds.get('pred_logits', [])) == 0:
             continue
 
         # 提取预测结果
-        logits = preds["pred_logits"]  # [num_queries, 1]
-        boxes = preds["pred_boxes"]  # [num_queries, 4]
-        masks = preds["pred_masks"]  # [num_queries, H, W]
+        logits = preds['pred_logits']  # [N, 1]
+        boxes = preds['pred_boxes']    # [N, 4]
+        masks = preds['pred_masks']    # [N, H, W]
 
-        scores = torch.sigmoid(logits).squeeze(-1)  # [num_queries]
+        if merge_cracks:
+            # Step 1: Filter by score threshold
+            pred_probs = torch.sigmoid(logits).squeeze(-1)  # [N]
+            valid_mask = pred_probs > prob_threshold
+            num_before = len(pred_probs)
 
-        # 按置信度阈值过滤
-        valid_mask = scores > score_threshold
-        num_before = len(scores)
-        scores = scores[valid_mask]
-        boxes = boxes[valid_mask]
-        masks = masks[valid_mask]
+            filtered_scores = pred_probs[valid_mask]
+            filtered_boxes = boxes[valid_mask]
+            filtered_masks = masks[valid_mask]
+
+            if len(filtered_masks) > 0:
+                # Step 2: Convert masks to binary
+                pred_masks_sigmoid = torch.sigmoid(filtered_masks)
+                pred_masks_binary = (pred_masks_sigmoid > 0.5)
+
+                # Step 3: MERGE overlapping crack segments
+                merged_masks, merged_scores, merged_boxes = merge_overlapping_masks(
+                    pred_masks_binary.cpu(),
+                    filtered_scores.cpu(),
+                    filtered_boxes.cpu(),
+                    iou_threshold=merge_iou_threshold
+                )
+
+                # Step 4: Top-K selection by score
+                if max_detections > 0 and len(merged_scores) > max_detections:
+                    top_k_scores, top_k_indices = torch.topk(merged_scores, k=max_detections, largest=True)
+                    merged_masks = merged_masks[top_k_indices]
+                    merged_scores = top_k_scores
+                    merged_boxes = merged_boxes[top_k_indices]
+
+                # Return merged results (already binary)
+                filtered_masks = merged_masks.float()  # Already binary, just convert to float
+                filtered_scores = merged_scores
+                filtered_boxes = merged_boxes
+            else:
+                filtered_masks = torch.tensor([])
+                filtered_scores = torch.tensor([])
+                filtered_boxes = torch.tensor([])
+        else:
+            # Apply SAM3's NMS pipeline (standard suppression)
+            filtered_masks, filtered_scores, filtered_boxes = apply_sam3_nms(
+                pred_logits=logits,
+                pred_masks=masks,
+                pred_boxes=boxes,
+                prob_threshold=prob_threshold,
+                nms_iou_threshold=nms_iou_threshold,
+                max_detections=max_detections
+            )
+
 
         if debug and img_id == image_ids[0]:  # 仅对首张图进行调试打印
             print(
-                f"  图像 {img_id}: {num_before} 个查询 -> 过滤后剩余 {len(scores)} 个 (阈值={score_threshold})"
+                f"  图像 {img_id}: {num_before} 个查询 -> 过滤后剩余 {len(filtered_scores)} 个 (阈值={prob_threshold})"
             )
 
-        # 转换为二值掩码
-        binary_masks = (torch.sigmoid(masks) > 0.5).cpu()
-
-        # 合并重叠预测，避免过度分割惩罚
-        if merge_overlaps and len(binary_masks) > 0:
-            num_before_merge = len(binary_masks)
-            binary_masks, scores, boxes = merge_overlapping_masks(
-                binary_masks, scores.cpu(), boxes.cpu(), iou_threshold=iou_threshold
-            )
-            if debug and img_id == image_ids[0]:
-                print(
-                    f"  合并前 {num_before_merge} 个 -> 合并后 {len(binary_masks)} 个 (IoU 阈值={iou_threshold})"
-                )
-
-        # 编码为 RLE (原生分辨率下非常快)
-        if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
-
-            if debug and img_id == image_ids[0]:
-                print(f"  掩码形状: {binary_masks.shape}")
-                print(
-                    f"  面积统计: 最小={mask_areas.min():.0f}, 最大={mask_areas.max():.0f}, 平均={mask_areas.float().mean():.0f}"
-                )
-
+        if len(filtered_masks) > 0:
+            # Convert filtered masks to binary for RLE encoding
+            binary_masks = (filtered_masks > 0.5).cpu()
             rles = rle_encode(binary_masks)
 
-            for _idx, (rle, score, box) in enumerate(
-                zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())
-            ):
-                # 将归一化的 CxCyWH 转换为像素坐标下的 [x, y, w, h]
+            for idx, (rle, score, box) in enumerate(zip(rles, filtered_scores.cpu().tolist(), filtered_boxes.cpu().tolist())):
                 cx, cy, w, h = box
-                x = (cx - w / 2) * resolution
-                y = (cy - h / 2) * resolution
+                x = (cx - w/2) * resolution
+                y = (cy - h/2) * resolution
                 w = w * resolution
                 h = h * resolution
 
-                coco_predictions.append(
-                    {
-                        "image_id": int(img_id),
-                        "category_id": 1,
-                        "segmentation": rle,
-                        "bbox": [float(x), float(y), float(w), float(h)],
-                        "score": float(score),
-                        "id": pred_id,
-                    }
-                )
+                pred_dict = {
+                    'image_id': int(img_id),
+                    'category_id': 1,
+                    'segmentation': rle,
+                    'bbox': [float(x), float(y), float(w), float(h)],
+                    'score': float(score),
+                    'id': pred_id
+                }
+
+                coco_predictions.append(pred_dict)
                 pred_id += 1
 
     return coco_predictions
 
 
 def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
-    """Create COCO ground truth dictionary from SimpleSAM3Dataset.
+    """Create COCO ground truth dictionary from dataset.
 
     OPTIMIZATION: Downsample GT masks to match prediction resolution (288×288)
     instead of upsampling predictions to 1008×1008. Much faster!
@@ -356,6 +578,9 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     Returns:
         Dictionary in COCO format
     """
+    
+    print(f"\n[INFO] Creating COCO ground truth (downsampling to {mask_resolution}×{mask_resolution})...")
+    
     coco_gt = {
         "info": {
             "description": "SAM3 LoRA Validation Dataset",
@@ -371,9 +596,14 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
     indices = range(len(dataset)) if image_ids is None else image_ids
 
     # Scale factor for boxes (masks will be at mask_resolution, boxes scaled accordingly)
-    scale_factor = mask_resolution / dataset.resolution
+    # scale_factor = mask_resolution / dataset.resolution
 
-    for idx in indices:
+    for idx in tqdm(list(indices), desc="Creating GT"):
+        # Check if idx is within valid range
+        if idx >= len(dataset):
+            print(f"[WARNING] Skipping index {idx} - out of range (dataset length: {len(dataset)})")
+            continue
+
         # Add image entry at mask resolution
         coco_gt["images"].append(
             {
@@ -389,9 +619,13 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
 
         # Add annotations
         for obj in datapoint.images[0].objects:
-            # Convert normalized CxCyWH box to COCO [x, y, w, h] at mask_resolution
-            cx, cy, bw, bh = (obj.bbox * mask_resolution).tolist()
-            x, y, w, h = cx - bw / 2, cy - bh / 2, bw, bh
+            box = obj.bbox * mask_resolution
+            # YOLO 格式，左上角坐标和右下角坐标
+            # x1, y1, x2, y2 = box.tolist()
+            # Convert normalized CxCyWH box to COCO [x, y, width, height] at mask_resolution
+            cx, cy, bw, bh = box.tolist()
+            # x, y, w, h = x1, y1, x2-x1, y2-y1   # 转化成 x, y, width, height
+            x, y, w, h = cx - bw / 2, cy - bh / 2, bw, bh  # 中心点坐标和宽高，且通常是归一化的
 
             ann = {
                 "id": ann_id,
@@ -425,6 +659,8 @@ def create_coco_gt_from_dataset(dataset, image_ids=None, mask_resolution=288):
             coco_gt["annotations"].append(ann)
             ann_id += 1
 
+    print(f"[INFO] Created {len(coco_gt['images'])} images, {len(coco_gt['annotations'])} annotations")
+
     return coco_gt
 
 
@@ -437,6 +673,7 @@ def convert_predictions_to_coco_format_original_res(
     merge_overlaps=True,
     iou_threshold=0.3,
     debug=False,
+    show_progress=False,
 ):
     """
     Convert model predictions to COCO format at ORIGINAL image resolution.
@@ -447,7 +684,8 @@ def convert_predictions_to_coco_format_original_res(
     3. Evaluation happens at original resolution
 
     Args:
-        predictions_list: List of predictions per image
+        predictions_list: List of predictions per image; an optional
+            original_size=(height, width) avoids loading the dataset again.
         image_ids: List of image IDs (indices into dataset)
         dataset: Dataset to get original image sizes
         model_resolution: Model output resolution (default: 288)
@@ -455,6 +693,7 @@ def convert_predictions_to_coco_format_original_res(
         merge_overlaps: Whether to merge overlapping predictions
         iou_threshold: IoU threshold for merging
         debug: Print debug info
+        show_progress: Display progress while converting a chunk
     """
     coco_predictions = []
     pred_id = 0
@@ -468,13 +707,21 @@ def convert_predictions_to_coco_format_original_res(
                 f"[DEBUG] Overlapping segment merging ENABLED (IoU threshold={iou_threshold})"
             )
 
-    for img_id, preds in zip(image_ids, predictions_list):
+    for img_id, preds in tqdm(
+        zip(image_ids, predictions_list),
+        total=len(predictions_list),
+        desc="Converting predictions",
+        disable=not show_progress,
+    ):
         if preds is None or len(preds.get("pred_logits", [])) == 0:
             continue
 
-        # Get original image size from dataset
-        datapoint = dataset[img_id]
-        orig_h, orig_w = datapoint.find_queries[0].inference_metadata.original_size
+        # Reuse inference metadata; older callers can still fall back to the dataset.
+        original_size = preds.get("original_size")
+        if original_size is None:
+            datapoint = dataset[img_id]
+            original_size = datapoint.find_queries[0].inference_metadata.original_size
+        orig_h, orig_w = map(int, original_size)
 
         logits = preds["pred_logits"]
         boxes = preds["pred_boxes"]
@@ -502,8 +749,7 @@ def convert_predictions_to_coco_format_original_res(
         if len(masks) == 0:
             continue
 
-        # Upsample masks from 288x288 to original resolution (like infer_sam.py)
-        # Process on GPU then immediately move to CPU to save memory
+        # Resize on the input tensor's device, then use CPU postprocessing.
         masks_sigmoid = torch.sigmoid(masks)  # [N, 288, 288]
         masks_upsampled = torch.nn.functional.interpolate(
             masks_sigmoid.unsqueeze(1).float(),  # [N, 1, 288, 288]
@@ -514,9 +760,8 @@ def convert_predictions_to_coco_format_original_res(
 
         binary_masks = (masks_upsampled > 0.5).cpu()
 
-        # Free GPU memory immediately after upsampling
+        # Release intermediates without clearing CUDA's reusable allocation cache.
         del masks_sigmoid, masks_upsampled
-        torch.cuda.empty_cache()
 
         # Merge overlapping predictions
         if merge_overlaps and len(binary_masks) > 0:
@@ -530,15 +775,19 @@ def convert_predictions_to_coco_format_original_res(
                 )
 
         if len(binary_masks) > 0:
-            mask_areas = binary_masks.flatten(1).sum(1)
-
             if debug and img_id == image_ids[0]:
+                mask_areas = binary_masks.flatten(1).sum(1)
                 print(f"[DEBUG]   Upsampled mask shape: {binary_masks.shape}")
                 print(
                     f"[DEBUG]   Mask areas: min={mask_areas.min():.0f}, max={mask_areas.max():.0f}, mean={mask_areas.float().mean():.0f}"
                 )
 
-            rles = rle_encode(binary_masks)
+            # COCO's native encoder is faster than tensor-based RLE on CPU.
+            rles = mask_utils.encode(
+                np.asfortranarray(binary_masks.numpy().transpose(1, 2, 0), dtype=np.uint8)
+            )
+            for rle in rles:
+                rle["counts"] = rle["counts"].decode("utf-8")
 
             for idx, (rle, score, box) in enumerate(
                 zip(rles, scores.cpu().tolist(), boxes.cpu().tolist())
@@ -621,15 +870,24 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
                 "height": orig_h,
                 "is_instance_exhaustive": True,
             }
-        )
+        ) 
 
         for obj in datapoint.images[0].objects:
-            # Convert normalized CxCyWH box to COCO [x, y, w, h] at original size
+            # YOLO 格式，左上角坐标和右下角坐标
+            # x1, y1, x2, y2 = obj.bbox.tolist()
             cx, cy, bw, bh = obj.bbox.tolist()
+
+            # Convert normalized CxCyWH box to COCO [x, y, w, h] at original size
             w = bw * orig_w
             h = bh * orig_h
             x = cx * orig_w - w / 2
             y = cy * orig_h - h / 2
+
+            # # Convert to COCO format [x, y, w, h]
+            # x = x1 * orig_w
+            # y = y1 * orig_h
+            # w = x2 * orig_w - x
+            # h = y2 * orig_h - y
 
             ann = {
                 "id": ann_id,
@@ -675,3 +933,224 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
     return coco_gt
 
+
+
+def compute_miou(coco_gt_dict, coco_predictions):
+    """
+    Compute Mean IoU (mIoU) and Overall IoU (oIoU) for Referring Expression Segmentation.
+
+    Args:
+        coco_gt_dict: COCO ground truth dict with 'images' and 'annotations'
+        coco_predictions: List of COCO prediction dicts
+
+    Returns:
+        dict with keys: miou, oiou, iou_object, iou_background, total_tp, total_fp, total_fn, total_tn
+    """
+
+    # Group GT annotations by image_id
+    gt_by_image = {}
+    for ann in coco_gt_dict['annotations']:
+        img_id = ann['image_id']
+        if img_id not in gt_by_image:
+            gt_by_image[img_id] = []
+        gt_by_image[img_id].append(ann)
+
+    # Group predictions by image_id
+    pred_by_image = {}
+    for pred in coco_predictions:
+        img_id = pred['image_id']
+        if img_id not in pred_by_image:
+            pred_by_image[img_id] = []
+        pred_by_image[img_id].append(pred)
+
+    # Image dimensions lookup
+    img_sizes = {img['id']: (img['height'], img['width']) for img in coco_gt_dict['images']}
+
+    # 累加混淆矩阵
+    total_tp = 0  # object pixels correctly predicted
+    total_fp = 0  # background pixels predicted as object
+    total_fn = 0  # object pixels predicted as background
+    total_tn = 0  # background pixels correctly predicted
+
+    # --- 关键修改 1: 增加 RES 专属的全局交集和并集计数器 ---
+    total_res_intersection = 0
+    total_res_union = 0
+
+    images_processed = 0
+    image_ious = []
+
+    for img_id, (h, w) in tqdm(img_sizes.items(), desc="Computing MIoU/OIoU"):
+        # Build GT binary mask (union of all object annotations)
+        gt_mask = np.zeros((h, w), dtype=np.uint8)
+        for ann in gt_by_image.get(img_id, []):
+            if 'segmentation' in ann:
+                try:
+                    decoded = mask_utils.decode(ann['segmentation'])
+                    gt_mask = np.logical_or(gt_mask, decoded).astype(np.uint8)
+                except Exception:
+                    pass
+
+        # Build prediction binary mask (union of all predicted objects)
+        pred_mask = np.zeros((h, w), dtype=np.uint8)
+        for pred in pred_by_image.get(img_id, []):
+            if 'segmentation' in pred:
+                try:
+                    decoded = mask_utils.decode(pred['segmentation'])
+                    pred_mask = np.logical_or(pred_mask, decoded).astype(np.uint8)
+                except Exception:
+                    pass
+
+        # Per-pixel metrics
+        intersection = np.logical_and(pred_mask, gt_mask).sum()
+        fp = np.logical_and(pred_mask, np.logical_not(gt_mask)).sum()
+        fn = np.logical_and(np.logical_not(pred_mask), gt_mask).sum()
+        tn = np.logical_and(np.logical_not(pred_mask), np.logical_not(gt_mask)).sum()
+
+        total_tp += intersection
+        total_fp += fp
+        total_fn += fn
+        total_tn += tn
+        images_processed += 1
+
+        # 循环内部 (计算单张图的 IoU 并累加用于 oIoU)
+        denom = (intersection + fp + fn)
+        img_iou = intersection / denom if denom > 0 else 0.0
+        image_ious.append(img_iou)
+
+        # --- 关键修改 2: 累加每张图的交集和并集，用于计算标准的 oIoU ---
+        total_res_intersection += intersection
+        total_res_union += denom
+
+    # 循环结束后
+    # RES 标准的 mIoU: 单张图 IoU 的均值 (也就是你之前的 mean_iou)
+    res_mIoU = np.mean(image_ious)
+
+    # --- 关键修改 3: 计算 RES 标准的 oIoU ---
+    res_oIoU = total_res_intersection / total_res_union if total_res_union > 0 else 0.0
+
+    # 你原本代码保留的语义分割指标（可用于监控或消融实验）
+    iou_object = total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) > 0 else 0.0
+    iou_bg = total_tn / (total_tn + total_fp + total_fn) if (total_tn + total_fp + total_fn) > 0 else 0.0
+
+    print(f"\n[RES Evaluation] Processed {images_processed} images")
+    print(f"[RES Evaluation] standard mIoU (Instance-average): {res_mIoU:.4f}")
+    print(f"[RES Evaluation] standard oIoU (Dataset-cumulative): {res_oIoU:.4f}")
+    print(f"[Semantic Meter] Semantic Object IoU: {iou_object:.4f}, Background IoU: {iou_bg:.4f}")
+
+    return {
+        'miou': res_mIoU,
+        'oiou': res_oIoU,            # 新增返回学术标准的 oIoU
+        'iou_object': iou_object,    # 对应你原本的指标
+        'iou_background': iou_bg,
+        'total_tp': int(total_tp),
+        'total_fp': int(total_fp),
+        'total_fn': int(total_fn),
+        'total_tn': int(total_tn),
+    }
+
+# def compute_miou(coco_gt_dict, coco_predictions):
+#     """
+#     Compute Mean IoU (mIoU) for binary segmentation.
+
+#     Builds per-image binary masks from RLE annotations, then computes
+#     pixel-level confusion matrix accumulated across all images.
+
+#     For binary (crack + background):
+#         crack_IoU = TP / (TP + FP + FN)
+#         bg_IoU    = TN / (TN + FP + FN)
+#         mIoU      = (crack_IoU + bg_IoU) / 2
+
+#     Args:
+#         coco_gt_dict: COCO ground truth dict with 'images' and 'annotations'
+#         coco_predictions: List of COCO prediction dicts
+
+#     Returns:
+#         dict with keys: miou, iou_object, iou_background, total_tp, total_fp, total_fn, total_tn
+#     """
+
+#     # Group GT annotations by image_id
+#     gt_by_image = {}
+#     for ann in coco_gt_dict['annotations']:
+#         img_id = ann['image_id']
+#         if img_id not in gt_by_image:
+#             gt_by_image[img_id] = []
+#         gt_by_image[img_id].append(ann)
+
+#     # Group predictions by image_id
+#     pred_by_image = {}
+#     for pred in coco_predictions:
+#         img_id = pred['image_id']
+#         if img_id not in pred_by_image:
+#             pred_by_image[img_id] = []
+#         pred_by_image[img_id].append(pred)
+
+#     # Image dimensions lookup
+#     img_sizes = {img['id']: (img['height'], img['width']) for img in coco_gt_dict['images']}
+
+#     # Accumulate confusion matrix
+#     total_tp = 0  # object pixels correctly predicted
+#     total_fp = 0  # background pixels predicted as object
+#     total_fn = 0  # object pixels predicted as background
+#     total_tn = 0  # background pixels correctly predicted
+
+#     images_processed = 0
+#     image_ious = []
+
+#     for img_id, (h, w) in tqdm(img_sizes.items(), desc="Computing MIoU"):
+#         # Build GT binary mask (union of all object annotations)
+#         gt_mask = np.zeros((h, w), dtype=np.uint8)
+#         for ann in gt_by_image.get(img_id, []):
+#             if 'segmentation' in ann:
+#                 try:
+#                     decoded = mask_utils.decode(ann['segmentation'])
+#                     gt_mask = np.logical_or(gt_mask, decoded).astype(np.uint8)
+#                 except Exception:
+#                     pass
+
+#         # Build prediction binary mask (union of all predicted objects)
+#         pred_mask = np.zeros((h, w), dtype=np.uint8)
+#         for pred in pred_by_image.get(img_id, []):
+#             if 'segmentation' in pred:
+#                 try:
+#                     decoded = mask_utils.decode(pred['segmentation'])
+#                     pred_mask = np.logical_or(pred_mask, decoded).astype(np.uint8)
+#                 except Exception:
+#                     pass
+
+#         # Per-pixel metrics
+#         intersection = np.logical_and(pred_mask, gt_mask).sum()
+#         fp = np.logical_and(pred_mask, np.logical_not(gt_mask)).sum()
+#         fn = np.logical_and(np.logical_not(pred_mask), gt_mask).sum()
+#         tn = np.logical_and(np.logical_not(pred_mask), np.logical_not(gt_mask)).sum()
+
+#         total_tp += intersection
+#         total_fp += fp
+#         total_fn += fn
+#         total_tn += tn
+#         images_processed += 1
+
+#         # 循环内部 (Per-pixel metrics 之后)
+#         denom = (intersection + fp + fn)
+#         img_iou = intersection / denom if denom > 0 else 0.0
+#         image_ious.append(img_iou)
+
+#     # 循环结束后
+#     mean_iou = np.mean(image_ious)
+
+#     # Per-class IoU
+#     iou_object = total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) > 0 else 0.0
+#     iou_bg = total_tn / (total_tn + total_fp + total_fn) if (total_tn + total_fp + total_fn) > 0 else 0.0
+#     # miou = (iou_object + iou_bg) / 2.0
+
+#     print(f"\n[MIoU] Processed {images_processed} images")
+#     print(f"[MIoU] Confusion matrix: TP={total_tp}, FP={total_fp}, FN={total_fn}, TN={total_tn}")
+
+#     return {
+#         'miou': mean_iou,
+#         'iou_object': iou_object,
+#         'iou_background': iou_bg,
+#         'total_tp': int(total_tp),
+#         'total_fp': int(total_fp),
+#         'total_fn': int(total_fn),
+#         'total_tn': int(total_tn),
+#     }

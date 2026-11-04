@@ -43,12 +43,15 @@ ENV/
 
 # Training outputs
 outputs/
+output_arxiv/
 experiments/
 logs/
 checkpoints/
 dumps/
 
 # Data
+asset/
+docs/
 /data/
 datasets/
 *.jpg

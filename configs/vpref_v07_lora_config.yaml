@@ -1,0 +1,50 @@
+# Full train/val release; same frozen v07 selection semantics and union-mask loader.
+model:
+  checkpoint_path: /home/icclab/Documents/lqw/sam3/weights/sam3.pt
+  bpe_path: /home/icclab/Documents/lqw/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.5
+  target_modules: [q_proj, k_proj, v_proj, out_proj, qkv, proj, fc1, fc2, c_fc, c_proj, linear1, linear2]
+  apply_to_vision_encoder: true
+  apply_to_text_encoder: true
+  apply_to_geometry_encoder: true
+  apply_to_detr_encoder: true
+  apply_to_detr_decoder: true
+  apply_to_mask_decoder: true
+training:
+  dataset: vpref_v03
+  data_dir: /home/icclab/Documents/lqw/DatasetMMF/VPRef_Vaihingen_v07
+  manifest: train.jsonl
+  task_families: []
+  domain: Vaihingen
+  resolution: 480
+  target_mode: union
+  rotation_degrees: [0]
+  batch_size: 16
+  num_workers: 0
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  num_epochs: 10
+  warmup_steps: 4
+  seed: 42
+  # New full-release queries have not inherited the pilot's human acceptance.
+  allow_unreviewed_proposals: true
+  require_validation: true
+  validation:
+    manifest: val.jsonl
+    allow_unreviewed_proposals: true
+output:
+  output_dir: outputs/vpref_v07
+hardware:
+  require_cuda: true
+experiment:
+  dataset_version: '0.7'
+  data_release: vpref-v07-1.0
+  canonical_rules: /home/icclab/Documents/lqw/VPRefDocu/VPRef_v07_dataset_rules.md
+  builder_version: vpref-v07-manifest-1.0
+  annotation_status: pending_human_review
+  validation: Original val development partition; not independent testing
+  object_ignore_area_px: 45
+  pixel_ignore: Mask focal/Dice and pixel metrics exclude ignore_mask_path pixels

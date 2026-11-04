@@ -19,13 +19,16 @@ Multi-GPU Training:
     CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_sam3_lora_native.py --config configs/full_lora_config.yaml --multi-gpu
 """
 
+import os
 import sys
 sys.path.append("/home/icclab/Documents/lqw/sam3_finetune_lora")  # Add project root to path
-    
+sys.path.append("/home/icclab/Documents/lqw/sam3_finetune_lora/scripts")
 
 import argparse
 import json
-import os
+import math
+import random
+import numpy as np
 from pathlib import Path
 
 import torch
@@ -35,6 +38,7 @@ import yaml
 from PIL import Image as PILImage
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 # from torchvision.transforms import v2
@@ -64,7 +68,10 @@ from sam3.train.masks_ops import rle_encode  # For encoding masks to RLE format
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 
 # Dataset backends (can also be selected via config['training']['dataset'])
-from data.vaihingen_dataset import VaiRefDataset
+from data.RefSegRS import RefSegRSDataset
+from data.isprs_dataset import ISPRSRefDataset
+from data.isprs_dataset_ss import ISPRSRefDataset_SS
+from data.rrsid import RRSISDDataset
 from data.COCODataset import COCOSegmentDataset, DirectCOCODataset
 from tools.utils import setup_distributed, cleanup_distributed, patch_dynamic_rope
 from tools.utils import is_main_process, get_world_size, get_rank, print_rank0
@@ -75,6 +82,20 @@ class SAM3TrainerNative:
         with open(config_path) as f:
             self.config = yaml.safe_load(f)
 
+        if self.config.get("hardware", {}).get("require_cuda", False) and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is unavailable. Use --check-data for CPU data validation; "
+                               "run training in an environment with an accessible NVIDIA GPU.")
+        seed = int(self.config["training"].get("seed", 42))
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # Create output directory; the source dataset remains read-only.
+        out_dir = Path(self.config["output"]["output_dir"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(out_dir, 'config.yaml'), 'w', encoding='utf-8') as fid:
+            yaml.safe_dump(self.config, fid, allow_unicode=True)
+        
         # Multi-GPU setup
         self.multi_gpu = multi_gpu
         self.local_rank = 0
@@ -120,10 +141,18 @@ class SAM3TrainerNative:
         )
         self.model = apply_lora_to_model(self.model, lora_config)
 
+        # ── Parameter Statistics ──
         stats = count_parameters(self.model)
-        print_rank0(
-            f"Trainable params: {stats['trainable_parameters']:,} ({stats['trainable_percentage']:.2f}%)"
-        )
+        total = stats['total_parameters']
+        trainable = stats['trainable_parameters']
+        frozen = total - trainable
+        print_rank0("=" * 50)
+        print_rank0("  Parameter Statistics")
+        print_rank0("=" * 50)
+        print_rank0(f"  Total parameters:      {total / 1e6:>10.2f}M")
+        print_rank0(f"  Trainable parameters:  {trainable / 1e6:>10.2f}M  ({stats['trainable_percentage']:.2f}%)")
+        print_rank0(f"  Frozen parameters:     {frozen / 1e6:>10.2f}M  ({100 - stats['trainable_percentage']:.2f}%)")
+        print_rank0("=" * 50)
 
         self.model.to(self.device)
 
@@ -147,28 +176,30 @@ class SAM3TrainerNative:
             weight_decay=self.config["training"]["weight_decay"],
         )
 
+        # LR scheduler will be created in train() once dataloader length is known
+        self.lr_scheduler = None
+
         # Matcher & Loss
         self.matcher = BinaryHungarianMatcherV2(
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
         )
 
-        # Create loss functions with correct weights (from original SAM3 training config)
-        # Note: These weights are for mask-based training
+        # Loss weights tuned for small-dataset LoRA fine-tuning (not massive pre-training).
         loss_fns = [
-            Boxes(weight_dict={"loss_bbox": 5.0, "loss_giou": 2.0}),
+            Boxes(weight_dict={"loss_bbox": 2.0, "loss_giou": 1.0}),
             IABCEMdetr(
-                pos_weight=10.0,
-                weight_dict={"loss_ce": 20.0, "presence_loss": 20.0},
+                pos_weight=5.0,
+                weight_dict={"loss_ce": 5.0, "presence_loss": 2.0},
                 pos_focal=False,
                 alpha=0.25,
                 gamma=2,
                 use_presence=True,
-                pad_n_queries=200,
+                pad_n_queries=100,
             ),
             Masks(
                 weight_dict={
-                    "loss_mask": 200.0,  # Much higher weight for mask loss!
-                    "loss_dice": 10.0,
+                    "loss_mask": 5.0,
+                    "loss_dice": 5.0,
                 },
                 focal_alpha=0.25,
                 focal_gamma=2.0,
@@ -198,13 +229,17 @@ class SAM3TrainerNative:
         # Load datasets
         print_rank0(f"\nLoading training data from {data_dir} (dataset={dataset_type})...")
 
-        if dataset_type == "vaihingen":
+        if dataset_type == "isprsRef":
             variant = self.config["training"].get("variant", "standard")
-            train_ds = VaiRefDataset(
-                data_dir=data_dir, split="train", variant=variant, resolution=480
+            print("current variant:", variant)
+            train_ds = ISPRSRefDataset(
+                data_dir=data_dir, 
+                split="train", 
+                variant=variant, 
+                resolution=480
             )
             has_validation = True
-            val_ds = VaiRefDataset(
+            val_ds = ISPRSRefDataset(
                 data_dir=data_dir, split="valid", variant=variant, resolution=480
             )
 
@@ -221,6 +256,14 @@ class SAM3TrainerNative:
                 # print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
                 # print(f"  Original size: {q.inference_metadata.original_size}")
 
+        elif dataset_type == "refsegrs":
+            train_ds = RefSegRSDataset(data_dir=data_dir, split="train", resolution=800)
+            has_validation = True
+            val_ds = RefSegRSDataset(data_dir=data_dir, split="valid", resolution=800)
+        elif dataset_type == "rrsisd":
+            train_ds = RRSISDDataset(data_dir=data_dir, split="train", resolution=480)
+            has_validation = True
+            val_ds = RRSISDDataset(data_dir=data_dir, split="valid", resolution=480)
         else:
             # Default: COCO format
             train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
@@ -285,15 +328,15 @@ class SAM3TrainerNative:
         self.model.train()
 
         # Weights from a standard SAM config roughly
-        weight_dict = {
-            "loss_ce": 2.0,
-            "loss_bbox": 5.0,
-            "loss_giou": 2.0,
-            "loss_mask": 5.0,
-            "loss_dice": 5.0,
-        }
+        # weight_dict = {
+        #     "loss_ce": 2.0,
+        #     "loss_bbox": 5.0,
+        #     "loss_giou": 2.0,
+        #     "loss_mask": 5.0,
+        #     "loss_dice": 5.0,
+        # }
 
-        epochs = self.config["training"]["num_epochs"]
+        epochs = int(self.config["training"]["num_epochs"])
         best_val_loss = float("inf")
         print_rank0(f"Starting training for {epochs} epochs...")
 
@@ -330,6 +373,22 @@ class SAM3TrainerNative:
         # Create output directory
         out_dir = Path(self.config["output"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── LR Scheduler: warmup + cosine annealing ──
+        total_steps = epochs * len(train_loader)
+        print("total_steps: ", total_steps)
+        warmup_steps = self.config["training"].get("warmup_steps", 500)
+        warmup_steps = min(warmup_steps, total_steps // 2)  # cap at 50% of total
+        print_rank0(f"LR schedule: warmup={warmup_steps} steps, total={total_steps} steps "
+                     f"(~{warmup_steps / max(1, len(train_loader)):.1f} epochs)")
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        self.lr_scheduler = LambdaLR(self.optimizer, lr_lambda)
 
         for epoch in range(epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
@@ -392,6 +451,7 @@ class SAM3TrainerNative:
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 self.optimizer.step()
+                self.lr_scheduler.step()
 
                 # Track training loss
                 train_losses.append(total_loss.item())
@@ -478,7 +538,6 @@ class SAM3TrainerNative:
                     save_lora_weights(
                         model_to_save, str(out_dir / "last_lora_weights.pt")
                     )
-
                     if avg_val_loss < best_val_loss:
                         best_val_loss = avg_val_loss
                         save_lora_weights(
@@ -671,7 +730,12 @@ Examples:
 
 
 
-# CUDA_VISIBLE_DEVICES=1 torchrun --nproc_per_node 1 scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0
+# CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node 1 scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0
 # torchrun --nproc_per_node 2 scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0 1
 
+# torchrun --nproc_per_node 2 scripts/training/train_sam3_lora_native.py --config configs/potsdam_lora_config.yaml --device 0 1
+# torchrun --nproc_per_node 2 scripts/training/train_sam3_lora_native.py --config configs/refsegrs_lora_config.yaml --device 0 1
+# torchrun --nproc_per_node 2 scripts/training/train_sam3_lora_native.py --config configs/rrsid_lora_config.yaml --device 0 1
 
+
+# python scripts/training/train_sam3_lora_native.py --config configs/vaihingen_lora_config.yaml --device 0

@@ -42,7 +42,7 @@ CLASS_TO_SUFFIX = {
 SUFFIX_TO_CLASS = {v: k for k, v in CLASS_TO_SUFFIX.items()}
 
 
-class VaiRefDataset(Dataset):
+class ISPRSRefDataset(Dataset):
     """
     Vaihingen Referring Segmentation Dataset wrapped for SAM3 training.
 
@@ -64,10 +64,12 @@ class VaiRefDataset(Dataset):
         split: str = "train",
         variant: str = "standard",
         resolution: int = 1008,
+        augment: bool = True,
     ):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.variant = variant
+        self.augment = augment and (split == "train")  # only augment training set
 
         # Map split names (SAM3 uses 'valid', VaiRef files use 'val')
         split_map = {"train": "train", "valid": "val", "val": "val", "test": "test"}
@@ -75,6 +77,9 @@ class VaiRefDataset(Dataset):
 
         # Read annotation file
         setfile = f"output_phrase_{vai_split}_{variant}.txt"
+        # setfile = f"output_phrase_test_standard_visulization.txt"
+        # setfile = f"output_phrase_test_simple_visulization.txt1"
+        # setfile = f"output_phrase_test_complex_visulization.txt"
         setfile_path = self.data_dir / setfile
 
         if not setfile_path.exists():
@@ -106,6 +111,8 @@ class VaiRefDataset(Dataset):
                 )
 
                 self.samples.append((str(img_path), str(mask_path), sentence))
+                # print("samples", self.samples[-1])  # Debug: print the last sample added
+                # print("length samples", len(self.samples))  # Debug: print total number of samples after each addition
 
         print(
             f"VaiRefDataset [{split}] loaded: {len(self.samples)} samples"
@@ -121,37 +128,71 @@ class VaiRefDataset(Dataset):
             ]
         )
 
+        # Spatial augmentation for training (applied to PIL image + mask jointly)
+        if self.augment:
+            self.aug_geometric = v2.Compose([
+                v2.RandomHorizontalFlip(p=0.5),
+                v2.RandomVerticalFlip(p=0.5),
+                # Random 90°-multiple rotation (preserves aerial geometry)
+                v2.RandomApply([
+                    v2.RandomRotation(degrees=(90, 90), expand=False),   # 90°
+                ], p=0.25),
+                v2.RandomApply([
+                    v2.RandomRotation(degrees=(180, 180), expand=False), # 180°
+                ], p=0.25),
+                v2.RandomApply([
+                    v2.RandomRotation(degrees=(270, 270), expand=False), # 270°
+                ], p=0.25),
+            ])
+            self.aug_color = v2.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+            )
+        else:
+            self.aug_geometric = None
+            self.aug_color = None
+
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Datapoint:
         img_path, mask_path, query_text = self.samples[idx]
 
-        # ── Load and resize image ──
+        # ── Load image and mask as PIL ──
         pil_image = PILImage.open(img_path).convert("RGB")
         orig_w, orig_h = pil_image.size
 
+        mask_pil = PILImage.open(mask_path).convert("L")
+        mask_np = np.array(mask_pil, dtype=np.uint8)
+        binary_mask = (mask_np > 50).astype(np.float32)
+        mask_pil_binary = PILImage.fromarray((binary_mask * 255).astype(np.uint8))
+
+        # ── Apply shared spatial augmentation (same transform for image + mask) ──
+        if self.aug_geometric is not None:
+            # print(f"Applying geometric augmentation to sample (image + mask)")
+            # Fix random seed so image and mask get the same flip/rotate
+            seed = torch.randint(0, 2**31, (1,)).item()
+            torch.manual_seed(seed)
+            pil_image = self.aug_geometric(pil_image)
+            torch.manual_seed(seed)
+            mask_pil_binary = self.aug_geometric(mask_pil_binary)
+
+        # ── Color augmentation (image only) ──
+        if self.aug_color is not None:
+            # print(f"Applying color augmentation to sample (image only)")
+            pil_image = self.aug_color(pil_image)
+
+        # ── Resize image ──
         pil_image_resized = pil_image.resize(
             (self.resolution, self.resolution), PILImage.BILINEAR
         )
         image_tensor = self.transform(pil_image_resized)
 
-        # ── Load and resize mask ──
-        mask_pil = PILImage.open(mask_path).convert("L")
-        mask_np = np.array(mask_pil, dtype=np.uint8)
-        binary_mask = (mask_np > 50).astype(np.float32)
-
-        # Resize to model resolution using nearest neighbor
-        mask_t = (
-            torch.from_numpy(binary_mask)
-            .float()
-            .unsqueeze(0)
-            .unsqueeze(0)
+        # ── Resize mask to model resolution ──
+        mask_pil_resized = mask_pil_binary.resize(
+            (self.resolution, self.resolution), PILImage.NEAREST
         )
-        mask_t = torch.nn.functional.interpolate(
-            mask_t, size=(self.resolution, self.resolution), mode="nearest"
-        )
-        mask_tensor = mask_t.squeeze() > 0.5  # [1008, 1008] bool
+        mask_np_resized = np.array(mask_pil_resized, dtype=np.uint8)
+        mask_tensor = torch.from_numpy(mask_np_resized > 127)  # [H, W] bool
 
         # ── Compute bounding box from mask ──
         bbox_tensor, area = self._compute_bbox_from_mask(mask_tensor)
@@ -230,7 +271,7 @@ class VaiRefDataset(Dataset):
 if __name__ == "__main__":
     data_root = "/home/icclab/Documents/lqw/DatasetMMF/VaihingenRef/"
 
-    ds = VaiRefDataset(data_dir=data_root, split="train", variant="standard")
+    ds = ISPRSRefDataset(data_dir=data_root, split="train", variant="standard")
     print(f"Total samples: {len(ds)}")
 
     for input_batch in ds:
@@ -238,23 +279,24 @@ if __name__ == "__main__":
         q = input_batch.find_queries[0]
         obj = img.objects[0]
         # print(f"\n--- Sample {i} ---")
-        print(f"  Image tensor: {img.data.shape}")
-        print(f"  Query: {q.query_text[:60]}...")
-        print(f"  Mask: {obj.segment.shape}, sum={obj.segment.sum().item():.0f} px")
-        print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
-        print(f"  Original size: {q.inference_metadata.original_size}")
+        # print(f"  Image tensor: {img.data.shape}")
+        # print(f"  Query: {q.query_text[:60]}...")
+        # print(f"  Mask: {obj.segment.shape}, sum={obj.segment.sum().item():.0f} px")
+        # print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
+        # print(f"  Original size: {q.inference_metadata.original_size}")
+        break
 
 
-    for i in range(3):
-        dp = ds[i]
-        img = dp.images[0]
-        q = dp.find_queries[0]
-        obj = img.objects[0]
-        print(f"\n--- Sample {i} ---")
-        print(f"  Image tensor: {img.data.shape}")
-        print(f"  Query: {q.query_text[:60]}...")
-        print(f"  Mask: {obj.segment.shape}, sum={obj.segment.sum().item():.0f} px")
-        print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
-        print(f"  Original size: {q.inference_metadata.original_size}")
+    # for i in range(3):
+    #     dp = ds[i]
+    #     img = dp.images[0]
+    #     q = dp.find_queries[0]
+    #     obj = img.objects[0]
+    #     print(f"\n--- Sample {i} ---")
+    #     print(f"  Image tensor: {img.data.shape}")
+    #     print(f"  Query: {q.query_text[:60]}...")
+    #     print(f"  Mask: {obj.segment.shape}, sum={obj.segment.sum().item():.0f} px")
+    #     print(f"  Bbox (CxCyWH): {obj.bbox.tolist()}")
+    #     print(f"  Original size: {q.inference_metadata.original_size}")
 
     print("\n✅ VaiRefDataset working correctly!")
